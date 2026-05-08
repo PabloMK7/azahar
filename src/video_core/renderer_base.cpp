@@ -8,6 +8,7 @@
 #include "core/hle/service/hid/hid.h"
 #include "core/tracer/recorder.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "video_core/rasterizer_cache/surface_debug.h"
 #include "video_core/renderer_base.h"
 
 namespace VideoCore {
@@ -46,6 +47,12 @@ void RendererBase::UpdateCurrentFramebufferLayout(bool is_portrait_mode) {
 }
 
 void RendererBase::EndFrame() {
+#ifdef ENABLE_SURFACE_VIEWER
+    SurfaceOpLog& op_log = GetSurfaceOpLog();
+    if (op_log.IsRecording()) [[unlikely]] {
+        op_log.RecordFrameEnd(current_frame);
+    }
+#endif
     current_frame++;
 
     system.perf_stats->EndSystemFrame();
@@ -63,6 +70,7 @@ void RendererBase::EndFrame() {
         }
     }
 
+    system.ProcessPendingWork(Core::WorkPoint::FrameEnd);
     system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
 
     // On fast enough devices, the time limiter sleep spans most of the 16ms period

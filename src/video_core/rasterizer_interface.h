@@ -7,7 +7,9 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <optional>
 #include "common/common_types.h"
+#include "video_core/rasterizer_cache/surface_debug.h"
 
 namespace Pica {
 struct OutputVertex;
@@ -93,6 +95,44 @@ public:
     virtual bool DiskResourcesLoadCrashed([[maybe_unused]] u64 title_id) {
         return false;
     }
+
+#ifdef ENABLE_SURFACE_VIEWER
+    virtual void SetSurfaceDebugTracking([[maybe_unused]] bool enabled) {}
+
+    /// Returns a copy of the state of the surface cache, if the rasterizer has one
+    virtual std::optional<SurfaceCacheDebugInfo> GetSurfaceDebugInfo() {
+        return std::nullopt;
+    }
+
+    /// Reads back a level of a cached surface for debugging, at its resolution scale if upscaled
+    virtual SurfaceDebugImage ReadSurfaceForDebug([[maybe_unused]] u32 index,
+                                                  [[maybe_unused]] const SurfaceParams& params,
+                                                  [[maybe_unused]] u32 level,
+                                                  [[maybe_unused]] bool upscaled) {
+        return {.error = "The renderer has no surface cache"};
+    }
+
+    /// Replaces the texture of a cached surface with a PNG, for debugging
+    virtual SurfaceDebugResult ImportSurfaceForDebug([[maybe_unused]] u32 index,
+                                                     [[maybe_unused]] const SurfaceParams& params,
+                                                     [[maybe_unused]] const std::string& path,
+                                                     [[maybe_unused]] bool upscaled) {
+        return {.error = "The renderer has no surface cache"};
+    }
+
+    /// Stops replacing a cached surface with an imported PNG
+    virtual SurfaceDebugResult RevertSurfaceImportForDebug(
+        [[maybe_unused]] u32 index, [[maybe_unused]] const SurfaceParams& params) {
+        return {.error = "The renderer has no surface cache"};
+    }
+
+    /// Saves a level of a cached surface to the custom texture pack of the running title
+    virtual SurfaceDebugResult SaveSurfaceToPackForDebug(
+        [[maybe_unused]] u32 index, [[maybe_unused]] const SurfaceParams& params,
+        [[maybe_unused]] u32 level) {
+        return {.error = "The renderer has no surface cache"};
+    }
+#endif
 
     static void SetSwitchDiskResourcesCallback(const DiskResourceLoadCallback& callback) {
         switch_disk_resources_callback = callback;

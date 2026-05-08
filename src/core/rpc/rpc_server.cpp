@@ -32,11 +32,19 @@ constexpr bool sync_with_core = false;
 RPCServer::RPCServer(Core::System& system_) : system{system_} {
     LOG_INFO(RPC_Server, "Starting RPC server ({}).",
              sync_with_core ? "synchronous" : "asynchronous");
+    if constexpr (sync_with_core) {
+        core_work_id =
+            system.RegisterWork(Core::WorkPoint::CpuSlice | Core::WorkPoint::FrameLimiterWait,
+                                [this] { ProcessCoreRequests(); });
+    }
     request_handler_thread =
         std::jthread([this](std::stop_token stop_token) { HandleRequestsLoop(stop_token); });
 }
 
 RPCServer::~RPCServer() {
+    if constexpr (sync_with_core) {
+        system.UnregisterWork(core_work_id);
+    }
     Stop();
 }
 
@@ -488,11 +496,9 @@ void RPCServer::HandleSingleRequest(std::unique_ptr<Packet> request_packet) {
 }
 
 void RPCServer::ProcessCoreRequests() {
-    if constexpr (sync_with_core) {
-        std::unique_ptr<Packet> request_packet;
-        while (core_request_queue.Pop(request_packet)) {
-            DispatchRequest(std::move(request_packet));
-        }
+    std::unique_ptr<Packet> request_packet;
+    while (core_request_queue.Pop(request_packet)) {
+        DispatchRequest(std::move(request_packet));
     }
 }
 

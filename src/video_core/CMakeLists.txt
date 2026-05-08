@@ -56,6 +56,7 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     rasterizer_cache/slot_id.h
     rasterizer_cache/surface_base.cpp
     rasterizer_cache/surface_base.h
+    rasterizer_cache/surface_debug.h
     rasterizer_cache/surface_params.cpp
     rasterizer_cache/surface_params.h
     rasterizer_cache/texture_codec.h
@@ -100,6 +101,11 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     video_core.h
 )
 
+if (ENABLE_SURFACE_VIEWER)
+    target_sources(video_core PRIVATE
+        rasterizer_cache/surface_debug.cpp
+    )
+endif()
 if (ENABLE_SOFTWARE_RENDERER)
     target_sources(video_core PRIVATE
         renderer_software/renderer_software.cpp

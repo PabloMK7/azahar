@@ -1,6 +1,6 @@
-// Copyright 2014 Citra Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -28,9 +28,9 @@ public:
     void OnBreakPointHit(Pica::DebugContext::Event event);
     void OnResumed();
 
-private:
     static QString DebugContextEventToString(Pica::DebugContext::Event event);
 
+private:
     std::weak_ptr<Pica::DebugContext> context_weak;
     bool at_breakpoint;
     Pica::DebugContext::Event active_breakpoint;

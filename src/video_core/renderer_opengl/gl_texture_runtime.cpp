@@ -571,6 +571,26 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 }
 
+#ifdef ENABLE_SURFACE_VIEWER
+void Surface::DownloadScaledForDebug(const VideoCore::BufferTextureCopy& download,
+                                     const VideoCore::StagingData& staging) {
+    const DebugScope scope(*runtime, Common::Vec4f{}, "Surface::DownloadScaledForDebug");
+
+    OpenGLState state = OpenGLState::GetCurState();
+    state.scissor.enabled = false;
+    state.draw.read_framebuffer = runtime->read_fbos[FboIndex(type)].handle;
+    state.Apply();
+
+    // Handle 1 is the upscaled texture
+    Attach(GL_READ_FRAMEBUFFER, download.texture_level, 0, 1);
+
+    const auto& tuple = runtime->GetFormatTuple(pixel_format);
+    const auto rect = download.texture_rect;
+    glReadPixels(rect.left, rect.bottom, rect.GetWidth(), rect.GetHeight(), tuple.format,
+                 tuple.type, staging.mapped.data());
+}
+#endif
+
 bool Surface::DownloadWithoutFbo(const VideoCore::BufferTextureCopy& download,
                                  const VideoCore::StagingData& staging) {
     const DebugScope scope(*runtime, Common::Vec4f{}, "Surface::DownloadWithoutFbo");

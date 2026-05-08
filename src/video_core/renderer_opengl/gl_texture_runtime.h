@@ -151,6 +151,13 @@ public:
     void Download(const VideoCore::BufferTextureCopy& download,
                   const VideoCore::StagingData& staging);
 
+#ifdef ENABLE_SURFACE_VIEWER
+    /// Downloads pixel data of the upscaled texture to staging without scaling it down. The
+    /// rectangle is in scaled coordinates. Used by the surface viewer.
+    void DownloadScaledForDebug(const VideoCore::BufferTextureCopy& download,
+                                const VideoCore::StagingData& staging);
+#endif
+
     /// Attaches a handle of surface to the specified framebuffer target
     void Attach(GLenum target, u32 level, u32 layer, u32 handle = 1);
 

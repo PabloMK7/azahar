@@ -105,8 +105,6 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     debugger/graphics/graphics_breakpoints_p.h
     debugger/graphics/graphics_cmdlists.cpp
     debugger/graphics/graphics_cmdlists.h
-    debugger/graphics/graphics_surface.cpp
-    debugger/graphics/graphics_surface.h
     debugger/graphics/graphics_tracing.cpp
     debugger/graphics/graphics_tracing.h
     debugger/graphics/graphics_vertex_shader.cpp
@@ -224,6 +222,19 @@ file(GLOB COMPAT_LIST
      ${PROJECT_BINARY_DIR}/dist/compatibility_list/compatibility_list.json)
 file(GLOB_RECURSE ICONS ${PROJECT_SOURCE_DIR}/dist/icons/*)
 file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
+
+if (ENABLE_SURFACE_VIEWER)
+    target_sources(citra_qt PRIVATE
+        debugger/debug_work_queue.cpp
+        debugger/debug_work_queue.h
+        debugger/graphics/graphics_surface.cpp
+        debugger/graphics/graphics_surface.h
+        debugger/graphics/graphics_surface_cache.cpp
+        debugger/graphics/graphics_surface_cache.h
+        debugger/graphics/graphics_surface_ops.cpp
+        debugger/graphics/graphics_surface_ops.h
+    )
+endif()
 
 if (ENABLE_QT_UPDATE_CHECKER)
     target_link_libraries(citra_qt PRIVATE httplib json-headers)

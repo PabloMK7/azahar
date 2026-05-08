@@ -4,10 +4,12 @@
 
 #pragma once
 
+#include <deque>
 #include <functional>
 #include <list>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <boost/icl/interval_map.hpp>
@@ -15,6 +17,7 @@
 
 #include "video_core/rasterizer_cache/framebuffer_base.h"
 #include "video_core/rasterizer_cache/sampler_params.h"
+#include "video_core/rasterizer_cache/surface_debug.h"
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/texture_cube.h"
 
@@ -55,6 +58,7 @@ enum class MatchFlags {
 DECLARE_ENUM_FLAG_OPERATORS(MatchFlags);
 
 class CustomTexManager;
+struct Material;
 class RendererBase;
 enum class SurfaceFlagBits : u32;
 
@@ -138,7 +142,132 @@ public:
     /// Clear all cached resources tracked by this cache manager
     void ClearAll(bool flush);
 
+#ifdef ENABLE_SURFACE_VIEWER
+    void SetDebugTracking(bool enabled);
+
+    /// Returns a copy of the state of every surface in the cache
+    SurfaceCacheDebugInfo GetDebugInfo() const;
+
+    /// Reads back a level of a surface for debugging, at its resolution scale if upscaled is true.
+    /// Fails if the surface at index no longer matches params or cannot be read back.
+    SurfaceDebugImage ReadSurfaceForDebug(u32 index, const SurfaceParams& params, u32 level,
+                                          bool upscaled);
+
+    /// Replaces the texture of a surface with a PNG, as a custom texture does. The PNG has the
+    /// size of the surface, or a larger size with its aspect ratio if upscaled is true. It is kept
+    /// for the guest data of the surface until it is reverted.
+    SurfaceDebugResult ImportSurfaceForDebug(u32 index, const SurfaceParams& params,
+                                             const std::string& path, bool upscaled);
+
+    /// Stops replacing a surface with an imported PNG and reloads it from guest memory.
+    SurfaceDebugResult RevertSurfaceImportForDebug(u32 index, const SurfaceParams& params);
+
+    /// Saves a level of a surface to the custom texture pack of the running title. Saves the
+    /// imported PNG if there is one, and the guest texture otherwise.
+    SurfaceDebugResult SaveSurfaceToPackForDebug(u32 index, const SurfaceParams& params, u32 level);
+#endif
+
+    /// Records how a surface was used in the current frame, while debug tracking is enabled
+    void MarkDebugUsage([[maybe_unused]] SurfaceId surface_id,
+                        [[maybe_unused]] SurfaceUsageBits usage) {
+#ifdef ENABLE_SURFACE_VIEWER
+        if (debug_tracking) [[unlikely]] {
+            RecordDebugUsage(slot_surfaces[surface_id], usage);
+        }
+#endif
+    }
+
+    /// Ends the draw that GetFramebufferSurfaces began in the operation log. Called once the
+    /// draw has invalidated its targets.
+    void EndDebugDraw() {
+#ifdef ENABLE_SURFACE_VIEWER
+        if (debug_draw_scope) [[unlikely]] {
+            debug_draw_scope = false;
+            EndDebugScope(false);
+        }
+#endif
+    }
+
 private:
+    /**
+     * Records an operation in the operation log of the surface viewer while it records. The
+     * operations recorded until the scope closes are nested in it. A lazy scope is recorded only
+     * if something is recorded in it or if it is forced, so that the many calls that do nothing
+     * do not fill the log.
+     */
+    class DebugOpScope {
+    public:
+#ifdef ENABLE_SURFACE_VIEWER
+        DebugOpScope(RasterizerCache& cache_, SurfaceOp op, PAddr start, PAddr end,
+                     Surface* surface = nullptr, Surface* other = nullptr,
+                     SurfaceOpValue value = {}, bool lazy = false)
+            : cache{cache_} {
+            if (cache.debug_tracking) [[unlikely]] {
+                open = cache.BeginDebugScope(op, start, end, surface, other, value, lazy);
+            }
+        }
+        ~DebugOpScope() {
+            if (open) [[unlikely]] {
+                if (expect_success && !succeeded) {
+                    cache.RecordDebugOp(SurfaceOp::NotAccelerated, 0, 0);
+                }
+                cache.EndDebugScope(force);
+            }
+        }
+
+        void Force() {
+            force = true;
+        }
+
+        void ExpectSuccess() {
+            expect_success = true;
+        }
+
+        void Succeed() {
+            succeeded = true;
+        }
+
+    private:
+        RasterizerCache& cache;
+        bool open = false;
+        bool force = false;
+        bool expect_success = false;
+        bool succeeded = false;
+#else
+        DebugOpScope(RasterizerCache&, SurfaceOp, PAddr, PAddr, Surface* = nullptr,
+                     Surface* = nullptr, SurfaceOpValue = {}, bool = false) {}
+        void Force() {}
+        void ExpectSuccess() {}
+        void Succeed() {}
+#endif
+        DebugOpScope(const DebugOpScope&) = delete;
+        DebugOpScope& operator=(const DebugOpScope&) = delete;
+    };
+
+    /// Records an operation in the operation log of the surface viewer, while it records.
+    void RecordDebugOp([[maybe_unused]] SurfaceOp op, [[maybe_unused]] PAddr start,
+                       [[maybe_unused]] PAddr end, [[maybe_unused]] Surface* surface = nullptr,
+                       [[maybe_unused]] Surface* other = nullptr,
+                       [[maybe_unused]] SurfaceOpValue value = {}) {
+#ifdef ENABLE_SURFACE_VIEWER
+        if (debug_tracking) [[unlikely]] {
+            WriteDebugOp(op, start, end, surface, other, value);
+        }
+#endif
+    }
+
+    /// Counts data moved between guest memory and a host texture, and records the operation.
+    /// op is Upload, CustomUpload, Download or FillDownload.
+    void RecordDebugTransfer([[maybe_unused]] SurfaceOp op, [[maybe_unused]] Surface& surface,
+                             [[maybe_unused]] PAddr start, [[maybe_unused]] PAddr end,
+                             [[maybe_unused]] u64 bytes) {
+#ifdef ENABLE_SURFACE_VIEWER
+        if (debug_tracking) [[unlikely]] {
+            CountDebugTransfer(op, surface, start, end, bytes);
+        }
+#endif
+    }
+
     /// Iterate over all page indices in a range
     template <typename Func>
     void ForEachPage(PAddr addr, std::size_t size, Func&& func) {
@@ -179,6 +308,20 @@ private:
     /// Computes the hash of the provided texture data.
     u64 ComputeHash(const SurfaceParams& load_info, std::span<u8> upload_data);
 
+    u64 ComputeHash(const SurfaceParams& load_info, std::span<u8> upload_data, bool use_new_hash);
+
+    void ReplaceWithMaterial(SurfaceId surface_id, Material* material, u32 level,
+                             bool generate_mipmaps);
+
+#ifdef ENABLE_SURFACE_VIEWER
+    /// Finds the surface at index for a debugging action. Sets error if it changed since the
+    /// snapshot that gave params.
+    Surface* FindSurfaceForDebug(u32 index, const SurfaceParams& params, std::string& error);
+
+    /// Reads back a level of an upscaled color surface at its resolution scale
+    SurfaceDebugImage ReadScaledSurfaceForDebug(Surface& surface, u32 level);
+#endif
+
     /// Update surface's texture for given region when necessary
     void ValidateSurface(SurfaceId surface, PAddr addr, u32 size);
 
@@ -213,6 +356,43 @@ private:
     /// Increase/decrease the number of surface in pages touching the specified region
     void UpdatePagesCachedCount(PAddr addr, u32 size, int delta);
 
+    /// Records how a surface was used in the current frame, while debug tracking is enabled
+    void MarkDebugUsage([[maybe_unused]] Surface& surface,
+                        [[maybe_unused]] SurfaceUsageBits usage) {
+#ifdef ENABLE_SURFACE_VIEWER
+        if (debug_tracking) [[unlikely]] {
+            RecordDebugUsage(surface, usage);
+        }
+#endif
+    }
+
+#ifdef ENABLE_SURFACE_VIEWER
+    void RecordDebugUsage(Surface& surface, SurfaceUsageBits usage);
+
+    /// Describes a surface for the operation log, giving it a unique ID if it has none
+    SurfaceOpSurface DescribeForDebugOp(Surface* surface);
+
+    void WriteOpenDebugScopes(SurfaceOpLog& log);
+
+    /// Appends an operation to the log, after the scopes it is nested in
+    void WriteDebugOp(SurfaceOp op, PAddr start, PAddr end, Surface* surface, Surface* other,
+                      SurfaceOpValue value);
+
+    /// Opens a scope of the operation log. Returns false if the log is not recording.
+    bool BeginDebugScope(SurfaceOp op, PAddr start, PAddr end, Surface* surface, Surface* other,
+                         SurfaceOpValue value, bool lazy);
+
+    /// Closes the innermost scope, recording it if it is forced and was not recorded yet
+    void EndDebugScope(bool force);
+
+    void CountDebugTransfer(SurfaceOp op, Surface& surface, PAddr start, PAddr end, u64 bytes);
+
+    /// Returns true for the placeholder surfaces bound in place of missing textures
+    static bool IsNullSurface(SurfaceId surface_id) {
+        return surface_id == NULL_SURFACE_ID || surface_id == NULL_SURFACE_CUBE_ID;
+    }
+#endif
+
 private:
     /// Frames a sentenced surface is kept for recycling after the runtime is done with it.
     static constexpr u64 RECYCLE_FRAMES = 9;
@@ -244,6 +424,22 @@ private:
     Settings::TextureFilter filter;
     bool dump_textures;
     bool use_custom_textures;
+#ifdef ENABLE_SURFACE_VIEWER
+    struct OpenDebugOp {
+        SurfaceOpRecord record;
+        bool written;
+    };
+
+    bool debug_tracking = false;
+    SurfaceDebugCounters debug_counters;
+    u64 debug_tracking_frame = 0;
+    SurfaceUniqueId debug_next_unique_id = 1;
+    SurfaceTransferStats debug_transfers;
+    /// Stats of the last frames that moved data, oldest first, the current frame last.
+    std::deque<SurfaceTransferStats> debug_transfer_history;
+    std::vector<OpenDebugOp> debug_scopes; ///< Open scopes of the operation log, outermost first.
+    bool debug_draw_scope = false;
+#endif
 };
 
 } // namespace VideoCore

@@ -1093,11 +1093,28 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
         BlitScale(blit, false);
     }
 
+    RecordDownload(Type::Base, download);
+}
+
+#ifdef ENABLE_SURFACE_VIEWER
+void Surface::DownloadScaledForDebug(const VideoCore::BufferTextureCopy& download,
+                                     const VideoCore::StagingData& staging) {
+    SCOPE_EXIT({
+        scheduler.Finish();
+        runtime.download_buffer.Commit(staging.size);
+    });
+
+    runtime.renderpass_cache.EndRendering();
+    RecordDownload(Type::Scaled, download);
+}
+#endif
+
+void Surface::RecordDownload(Type image_type, const VideoCore::BufferTextureCopy& download) {
     const RecordParams params = {
         .aspect = Aspect(),
         .pipeline_flags = PipelineStageFlags(),
         .src_access = AccessFlags(),
-        .src_image = Image(Type::Base),
+        .src_image = Image(image_type),
     };
 
     scheduler.Record(

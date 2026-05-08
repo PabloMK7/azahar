@@ -1,10 +1,11 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
 #include <boost/icl/interval_set.hpp>
+#include "video_core/rasterizer_cache/surface_debug.h"
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/utils.h"
 
@@ -90,6 +91,9 @@ public:
     u32 fill_size = 0;
     std::array<u8, 4> fill_data{};
     u64 modification_tick = 1;
+#ifdef ENABLE_SURFACE_VIEWER
+    SurfaceDebugTracking debug{};
+#endif
 };
 
 } // namespace VideoCore

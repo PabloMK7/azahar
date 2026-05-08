@@ -1,6 +1,6 @@
-// Copyright 2014 Citra Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <QBoxLayout>
 #include <QComboBox>
@@ -11,8 +11,12 @@
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QSpinBox>
+#include <QTabWidget>
 #include "citra_qt/debugger/graphics/graphics_surface.h"
+#include "citra_qt/debugger/graphics/graphics_surface_cache.h"
+#include "citra_qt/debugger/graphics/graphics_surface_ops.h"
 #include "citra_qt/util/spinbox.h"
 #include "common/color.h"
 #include "core/core.h"
@@ -49,11 +53,11 @@ void SurfacePicture::mouseMoveEvent(QMouseEvent* event) {
     mousePressEvent(event);
 }
 
-GraphicsSurfaceWidget::GraphicsSurfaceWidget(Core::System& system_,
-                                             std::shared_ptr<Pica::DebugContext> debug_context,
+GraphicsSurfaceWidget::GraphicsSurfaceWidget(Core::System& system_, DebugWorkQueue& work_queue,
+                                             std::shared_ptr<Pica::DebugContext> debug_context_,
                                              QWidget* parent)
-    : BreakPointObserverDock(debug_context, tr("Pica Surface Viewer"), parent), system{system_},
-      surface_source(Source::ColorBuffer) {
+    : BreakPointObserverDock(debug_context_, tr("Pica Surface Viewer"), parent), system{system_},
+      debug_context{debug_context_}, surface_source(Source::ColorBuffer) {
     setObjectName(QStringLiteral("PicaSurface"));
 
     surface_source_list = new QComboBox;
@@ -203,24 +207,144 @@ GraphicsSurfaceWidget::GraphicsSurfaceWidget(Core::System& system_,
 
     main_layout->addWidget(save_surface);
     main_widget->setLayout(main_layout);
-    setWidget(main_widget);
+    manual_widget = main_widget;
+
+    cache_view = new SurfaceCacheView(system, work_queue);
+    tabs = new QTabWidget;
+    ops_view = new SurfaceOpView(system, work_queue);
+    tabs->addTab(cache_view, tr("Cached surfaces"));
+    tabs->addTab(ops_view, tr("Operations"));
+    tabs->addTab(manual_widget, tr("Manual"));
+
+    pause_button = new QPushButton(tr("Pause"));
+    step_button = new QPushButton(tr("Step frame"));
+    continue_button = new QPushButton(tr("Continue"));
+    auto controls_layout = new QHBoxLayout;
+    controls_layout->addWidget(pause_button);
+    controls_layout->addWidget(step_button);
+    controls_layout->addWidget(continue_button);
+    controls_layout->addStretch();
+
+    auto dock_widget = new QWidget;
+    auto dock_layout = new QVBoxLayout(dock_widget);
+    dock_layout->addLayout(controls_layout);
+    dock_layout->addWidget(tabs);
+    setWidget(dock_widget);
+
+    connect(pause_button, &QPushButton::clicked, this, &GraphicsSurfaceWidget::PauseRequested);
+    connect(continue_button, &QPushButton::clicked, this, [this] {
+        const auto context = debug_context.lock();
+        if (context && context->at_breakpoint) {
+            context->Resume();
+        } else {
+            emit ContinueRequested();
+        }
+    });
+    connect(step_button, &QPushButton::clicked, this, [this] {
+        emit StepRequested();
+        cache_view->OnFrameStepped();
+    });
+    connect(cache_view, &SurfaceCacheView::OpenInManual, this,
+            &GraphicsSurfaceWidget::ShowInManual);
+    connect(ops_view, &SurfaceOpView::ShowSurface, this,
+            [this](u32 index, VideoCore::SurfaceUniqueId unique_id) {
+                cache_view->SelectSurface(index, unique_id);
+                tabs->setCurrentWidget(cache_view);
+            });
+    connect(tabs, &QTabWidget::currentChanged, this, &GraphicsSurfaceWidget::UpdateCacheViewActive);
+    connect(this, &QDockWidget::visibilityChanged, this,
+            &GraphicsSurfaceWidget::UpdateCacheViewActive);
+    OnEmulationStateChanged(false, false);
 
     // Load current data - TODO: Make sure this works when emulation is not running
-    if (debug_context && debug_context->at_breakpoint) {
+    if (debug_context_ && debug_context_->at_breakpoint) {
         emit Update();
-        widget()->setEnabled(debug_context->at_breakpoint);
+        manual_widget->setEnabled(true);
+        cache_view->OnBreakpoint(true, debug_context_->active_breakpoint);
     } else {
-        widget()->setEnabled(false);
+        // Without Pica debugging there are no breakpoints to wait for
+        manual_widget->setEnabled(!debug_context_);
     }
 }
 
 void GraphicsSurfaceWidget::OnBreakPointHit(Pica::DebugContext::Event event, const void* data) {
     emit Update();
-    widget()->setEnabled(true);
+    manual_widget->setEnabled(true);
+    cache_view->OnBreakpoint(true, event);
+    UpdateMenuButtons(true);
 }
 
 void GraphicsSurfaceWidget::OnResumed() {
-    widget()->setEnabled(false);
+    manual_widget->setEnabled(false);
+    cache_view->OnBreakpoint(false, {});
+    // Resume() notifies observers before it clears at_breakpoint
+    UpdateMenuButtons(false);
+}
+
+void GraphicsSurfaceWidget::OnPicaBreakPointHitBeforeFlush(Pica::DebugContext::Event event) {
+    cache_view->CaptureAtBreakpoint();
+}
+
+void GraphicsSurfaceWidget::UpdateCacheViewActive() {
+    // Surface tracking only runs while the cached surfaces are on screen.
+    cache_view->SetActive(isVisible() && tabs->currentWidget() == cache_view);
+}
+
+void GraphicsSurfaceWidget::OnEmulationStateChanged(bool running, bool paused) {
+    // The manual view decodes guest memory, which is gone once the emulation stops
+    if (emulation_running && !running) {
+        surface_picture_label->clear();
+        surface_info_label->clear();
+        save_surface->setEnabled(false);
+    }
+    emulation_running = running;
+    emulation_paused = paused;
+    const auto context = debug_context.lock();
+    UpdateMenuButtons(context && context->at_breakpoint);
+    cache_view->OnEmulationStateChanged(running, paused);
+    ops_view->OnEmulationStateChanged(running, paused);
+}
+
+void GraphicsSurfaceWidget::UpdateMenuButtons(bool at_breakpoint) {
+    pause_button->setEnabled(emulation_running && !emulation_paused);
+    step_button->setEnabled(emulation_running && emulation_paused && !at_breakpoint);
+    continue_button->setEnabled(emulation_running && (emulation_paused || at_breakpoint));
+}
+
+void GraphicsSurfaceWidget::ShowInManual(u32 address, u32 width, u32 height,
+                                         VideoCore::PixelFormat pixel_format) {
+    Format format = Format::Unknown;
+    if (pixel_format <= VideoCore::PixelFormat::ETC1A4) {
+        // Texture formats have the same values in both enumerations.
+        format = static_cast<Format>(pixel_format);
+    } else if (pixel_format == VideoCore::PixelFormat::D16) {
+        format = Format::D16;
+    } else if (pixel_format == VideoCore::PixelFormat::D24) {
+        format = Format::D24;
+    } else if (pixel_format == VideoCore::PixelFormat::D24S8) {
+        format = Format::D24X8;
+    }
+
+    // Set every control before a single update, so no update sees a mix of old and new values
+    {
+        const QSignalBlocker source_blocker{surface_source_list};
+        const QSignalBlocker address_blocker{surface_address_control};
+        const QSignalBlocker width_blocker{surface_width_control};
+        const QSignalBlocker height_blocker{surface_height_control};
+        const QSignalBlocker format_blocker{surface_format_control};
+        surface_source_list->setCurrentIndex(static_cast<int>(Source::Custom));
+        surface_address_control->SetValue(address);
+        surface_width_control->setValue(static_cast<int>(width));
+        surface_height_control->setValue(static_cast<int>(height));
+        surface_format_control->setCurrentIndex(static_cast<int>(format));
+    }
+    surface_source = Source::Custom;
+    surface_address = address;
+    surface_width = static_cast<unsigned>(surface_width_control->value());
+    surface_height = static_cast<unsigned>(surface_height_control->value());
+    surface_format = format;
+    tabs->setCurrentWidget(manual_widget);
+    emit Update();
 }
 
 void GraphicsSurfaceWidget::OnSurfaceSourceChanged(int new_value) {
@@ -256,6 +380,10 @@ void GraphicsSurfaceWidget::OnSurfaceHeightChanged(int new_value) {
 }
 
 void GraphicsSurfaceWidget::OnSurfaceFormatChanged(int new_value) {
+    // The combo box reports -1 when it has no selection
+    if (new_value < 0) {
+        return;
+    }
     if (surface_format != static_cast<Format>(new_value)) {
         surface_format = static_cast<Format>(new_value);
 

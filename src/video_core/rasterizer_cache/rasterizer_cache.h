@@ -5,6 +5,7 @@
 #pragma once
 
 #include <type_traits>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
 #include "common/alignment.h"
@@ -12,6 +13,7 @@
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/texture.h"
 #include "core/memory.h"
 #include "video_core/custom_textures/custom_tex_manager.h"
 #include "video_core/pica/regs_external.h"
@@ -125,12 +127,25 @@ void RasterizerCache<T>::TickFrame() {
         if (use_custom_textures) {
             custom_tex_manager.FindCustomTextures();
         }
+#ifdef ENABLE_SURFACE_VIEWER
+        // Loading a pack can change the hashing method that imported textures were keyed with
+        if (use_custom_texture_changed) {
+            custom_tex_manager.ClearImportedMaterials();
+        }
+#endif
         UnregisterAll();
     }
 }
 
 template <class T>
 void RasterizerCache<T>::SentenceSurface(SurfaceId surface_id) {
+#ifdef ENABLE_SURFACE_VIEWER
+    if (debug_tracking) [[unlikely]] {
+        debug_counters.sentenced++;
+        Surface& surface = slot_surfaces[surface_id];
+        WriteDebugOp(SurfaceOp::Sentence, surface.addr, surface.end, &surface, nullptr, {});
+    }
+#endif
     sentenced.push_back({
         .surface_id = surface_id,
         .resource_tick = runtime.GetResourceTick(),
@@ -153,6 +168,13 @@ void RasterizerCache<T>::RunGarbageCollector() {
             it++;
             continue;
         }
+#ifdef ENABLE_SURFACE_VIEWER
+        if (debug_tracking) [[unlikely]] {
+            debug_counters.deleted++;
+            Surface& surface = slot_surfaces[it->surface_id];
+            WriteDebugOp(SurfaceOp::Delete, surface.addr, surface.end, &surface, nullptr, {});
+        }
+#endif
         RemoveFramebuffers(it->surface_id);
         slot_surfaces.erase(it->surface_id);
         it = sentenced.erase(it);
@@ -199,6 +221,10 @@ template <class T>
 bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
                            "RasterizerCache::AccelerateTextureCopy ({})", config.DebugName()};
+    DebugOpScope op_scope(*this, SurfaceOp::TextureCopy, config.GetPhysicalInputAddress(),
+                          config.GetPhysicalInputAddress() + config.texture_copy.size, nullptr,
+                          nullptr, {.output_addr = config.GetPhysicalOutputAddress()});
+    op_scope.ExpectSuccess();
 
     // Texture copy size is aligned to 16 byte units
     const u32 copy_size = Common::AlignDown(config.texture_copy.size, 16);
@@ -294,8 +320,12 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
         .extent = {src_rect.GetWidth(), src_rect.GetHeight()},
     };
     runtime.CopyTextures(src_surface, dst_surface, texture_copy);
+    MarkDebugUsage(src_surface, SurfaceUsageBits::TransferSource);
+    MarkDebugUsage(dst_surface, SurfaceUsageBits::TransferDest);
+    RecordDebugOp(SurfaceOp::Copy, dst_params.addr, dst_params.end, &dst_surface, &src_surface);
 
     InvalidateRegion(dst_params.addr, dst_params.size, dst_surface_id);
+    op_scope.Succeed();
     return true;
 }
 
@@ -303,6 +333,10 @@ template <class T>
 bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
                            "RasterizerCache::AccelerateDisplayTransfer ({})", config.DebugName()};
+    DebugOpScope op_scope(*this, SurfaceOp::DisplayTransfer, config.GetPhysicalInputAddress(),
+                          config.GetPhysicalInputAddress(), nullptr, nullptr,
+                          {.output_addr = config.GetPhysicalOutputAddress()});
+    op_scope.ExpectSuccess();
 
     SurfaceParams src_params;
     src_params.addr = config.GetPhysicalInputAddress();
@@ -366,8 +400,12 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
         .dst_rect = dst_rect,
     };
     runtime.BlitTextures(src_surface, dst_surface, texture_blit);
+    MarkDebugUsage(src_surface, SurfaceUsageBits::TransferSource);
+    MarkDebugUsage(dst_surface, SurfaceUsageBits::TransferDest);
+    RecordDebugOp(SurfaceOp::Blit, dst_params.addr, dst_params.end, &dst_surface, &src_surface);
 
     InvalidateRegion(dst_params.addr, dst_params.size, dst_surface_id);
+    op_scope.Succeed();
     return true;
 }
 
@@ -382,9 +420,22 @@ bool RasterizerCache<T>::AccelerateFill(const Pica::MemoryFillConfig& config) {
     params.size = params.end - params.addr;
     params.type = SurfaceType::Fill;
     params.res_scale = std::numeric_limits<u16>::max();
+    DebugOpScope op_scope(*this, SurfaceOp::MemoryFill, params.addr, params.end, nullptr, nullptr,
+                          {.fill_value = config.value_32bit});
 
     SurfaceId fill_surface_id = slot_surfaces.insert(runtime, params);
     Surface& fill_surface = slot_surfaces[fill_surface_id];
+#ifdef ENABLE_SURFACE_VIEWER
+    if (debug_tracking) [[unlikely]] {
+        debug_counters.fills_created++;
+        fill_surface.debug.created_frame = renderer.GetCurrentFrame();
+        fill_surface.debug.creation_tracked = true;
+        fill_surface.debug.unique_id = debug_next_unique_id++;
+        RecordDebugUsage(fill_surface, SurfaceUsageBits::Fill);
+        WriteDebugOp(SurfaceOp::Create, fill_surface.addr, fill_surface.end, &fill_surface, nullptr,
+                     {});
+    }
+#endif
 
     std::memcpy(&fill_surface.fill_data[0], &config.value_32bit, sizeof(u32));
     if (config.fill_32bit) {
@@ -452,6 +503,8 @@ template <class T>
 void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
                                      SurfaceInterval copy_interval) {
     MICROPROFILE_SCOPE(RasterizerCache_CopySurface);
+    MarkDebugUsage(src_surface, SurfaceUsageBits::CopySource);
+    MarkDebugUsage(dst_surface, SurfaceUsageBits::CopyDest);
     const PAddr copy_addr = copy_interval.lower();
     const SurfaceParams subrect_params = dst_surface.FromInterval(copy_interval);
     ASSERT(subrect_params.GetInterval() == copy_interval);
@@ -463,6 +516,8 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
             .value = src_surface.MakeClearValue(copy_addr, dst_surface.pixel_format),
         };
         runtime.ClearTexture(dst_surface, clear);
+        RecordDebugOp(SurfaceOp::Clear, copy_interval.lower(), copy_interval.upper(), &dst_surface,
+                      &src_surface);
         return;
     }
 
@@ -472,6 +527,8 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
     const u32 dst_sample_count = dst_surface.sample_count;
     if ((src_scale > dst_scale) || (src_sample_count > dst_sample_count)) {
         dst_surface.ScaleUp(src_scale, src_sample_count);
+        RecordDebugOp(SurfaceOp::ScaleUp, dst_surface.addr, dst_surface.end, &dst_surface, nullptr,
+                      {.scale = dst_surface.res_scale});
     }
 
     const auto src_rect = src_surface.GetScaledSubRect(subrect_params);
@@ -485,6 +542,8 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
             .extent = {src_rect.GetWidth(), src_rect.GetHeight()},
         };
         runtime.CopyTextures(src_surface, dst_surface, copy);
+        RecordDebugOp(SurfaceOp::Copy, copy_interval.lower(), copy_interval.upper(), &dst_surface,
+                      &src_surface);
     } else {
         const TextureBlit blit = {
             .src_level = src_surface.LevelOf(copy_addr),
@@ -493,6 +552,8 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
             .dst_rect = dst_rect,
         };
         runtime.BlitTextures(src_surface, dst_surface, blit);
+        RecordDebugOp(SurfaceOp::Blit, copy_interval.lower(), copy_interval.upper(), &dst_surface,
+                      &src_surface);
     }
 }
 
@@ -632,6 +693,10 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
             .dst_rect = tmp_surface.GetScaledRect(),
         };
         runtime.BlitTextures(src_surface, tmp_surface, blit);
+        RecordDebugOp(SurfaceOp::TemporaryCopy, params.addr, params.end, &tmp_surface,
+                      &src_surface);
+        MarkDebugUsage(src_surface, SurfaceUsageBits::CopySource);
+        MarkDebugUsage(tmp_surface, SurfaceUsageBits::Texture);
         return tmp_surface_id;
     }
     if (info.width != (min_width << max_level) || info.height != (min_height << max_level)) {
@@ -641,7 +706,11 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
     }
 
     SurfaceId surface_id = GetSurface(params, ScaleMatch::Ignore, true, initial_flags);
-    return surface_id ? surface_id : NULL_SURFACE_ID;
+    if (!surface_id) {
+        return NULL_SURFACE_ID;
+    }
+    MarkDebugUsage(slot_surfaces[surface_id], SurfaceUsageBits::Texture);
+    return surface_id;
 }
 
 template <class T>
@@ -723,8 +792,11 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
             });
         }
         runtime.CopyTextures(surface, cube_surface, upload_copies);
+        RecordDebugOp(SurfaceOp::CubeFaceCopy, surface.addr, surface.end, &cube_surface, &surface,
+                      {.face = i});
     }
 
+    MarkDebugUsage(cube_surface, SurfaceUsageBits::Texture);
     return slot_surfaces[cube.surface_id];
 }
 
@@ -790,11 +862,22 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         fb_rect = depth_rect;
     }
 
+#ifdef ENABLE_SURFACE_VIEWER
+    if (debug_tracking && (color_id || depth_id)) [[unlikely]] {
+        // Ended by EndDebugDraw, once the draw has invalidated its targets
+        EndDebugDraw();
+        const auto& interval = color_id ? color_vp_interval : depth_vp_interval;
+        debug_draw_scope = BeginDebugScope(SurfaceOp::Draw, interval.lower(), interval.upper(),
+                                           color_id ? &slot_surfaces[color_id] : nullptr,
+                                           depth_id ? &slot_surfaces[depth_id] : nullptr, {}, true);
+    }
+#endif
     if (color_id) {
         // Validation can grow slot_surfaces, reference lifetime should expire after validation
         Surface& color_surface = slot_surfaces[color_id];
         color_level = color_surface.LevelOf(color_params.addr);
         color_surface.flags |= SurfaceFlagBits::RenderTarget;
+        MarkDebugUsage(color_surface, SurfaceUsageBits::ColorTarget);
         ValidateSurface(color_id, boost::icl::first(color_vp_interval),
                         boost::icl::length(color_vp_interval));
     }
@@ -803,6 +886,7 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         Surface& depth_surface = slot_surfaces[depth_id];
         depth_level = depth_surface.LevelOf(depth_params.addr);
         depth_surface.flags |= SurfaceFlagBits::RenderTarget;
+        MarkDebugUsage(depth_surface, SurfaceUsageBits::DepthTarget);
         ValidateSurface(depth_id, boost::icl::first(depth_vp_interval),
                         boost::icl::length(depth_vp_interval));
     }
@@ -1037,6 +1121,8 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
     const DebugScope scope{runtime, Common::Vec4f{0.f, 1.f, 0.f, 1.f},
                            "RasterizerCache::ValidateSurface (from {:#x} to {:#x})", addr,
                            addr + size};
+    DebugOpScope op_scope(*this, SurfaceOp::Validate, addr, addr + size,
+                          &slot_surfaces[surface_id]);
 
     while (!validate_regions.empty()) {
         // A synchronous custom upload can grow slot_surfaces and invalidate Surface&
@@ -1071,7 +1157,8 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         }
 
         FlushRegion(params.addr, params.size);
-        if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
+        const bool use_custom = use_custom_textures || custom_tex_manager.HasImportedMaterials();
+        if (!use_custom || !UploadCustomSurface(surface_id, interval)) {
             UploadSurface(slot_surfaces[surface_id], interval);
         }
         notify_validated(params.GetInterval());
@@ -1082,18 +1169,20 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
     Surface& surface = slot_surfaces[surface_id];
     if (surface.res_scale != 1 && level != 0) {
         runtime.GenerateMipmaps(surface);
+        RecordDebugOp(SurfaceOp::GenerateMipmaps, surface.addr, surface.end, &surface);
     }
 }
 
 template <class T>
 void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
+    MarkDebugUsage(surface, SurfaceUsageBits::Upload);
 
     const SurfaceParams load_info = surface.FromInterval(interval);
     ASSERT(load_info.addr >= surface.addr && load_info.end <= surface.end);
 
-    const auto staging = runtime.FindStaging(
-        load_info.width * load_info.height * surface.GetInternalBytesPerPixel(), true);
+    const u32 upload_size = load_info.width * load_info.height * surface.GetInternalBytesPerPixel();
+    const auto staging = runtime.FindStaging(upload_size, true);
 
     MemoryRef source_ptr = memory.GetPhysicalRef(load_info.addr);
     if (!source_ptr) [[unlikely]] {
@@ -1119,11 +1208,18 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
         .texture_level = surface.LevelOf(load_info.addr),
     };
     surface.Upload(upload, staging);
+    RecordDebugTransfer(SurfaceOp::Upload, surface, load_info.addr, load_info.end, upload_size);
 }
 
 template <class T>
 u64 RasterizerCache<T>::ComputeHash(const SurfaceParams& load_info, std::span<u8> upload_data) {
-    if (!custom_tex_manager.UseNewHash()) {
+    return ComputeHash(load_info, upload_data, custom_tex_manager.UseNewHash());
+}
+
+template <class T>
+u64 RasterizerCache<T>::ComputeHash(const SurfaceParams& load_info, std::span<u8> upload_data,
+                                    bool use_new_hash) {
+    if (!use_new_hash) {
         const u32 width = load_info.width;
         const u32 height = load_info.height;
         const u32 bpp = GetFormatBytesPerPixel(load_info.pixel_format);
@@ -1153,7 +1249,12 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
     const u64 hash = ComputeHash(load_info, upload_data);
 
     const u32 level = surface.LevelOf(load_info.addr);
-    Material* material = custom_tex_manager.GetMaterial(hash);
+    // A texture imported by the debugging tool takes the place of the pack's
+    Material* material = custom_tex_manager.FindImportedMaterial(hash);
+    const bool imported = material != nullptr;
+    if (!material && use_custom_textures) {
+        material = custom_tex_manager.GetMaterial(hash);
+    }
 
     if (!material) {
         return surface.IsCustom();
@@ -1164,12 +1265,14 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
 
     // Dump skips a surface that already has this flag, so set it before that upload
     surface.flags |= SurfaceFlagBits::Custom;
+    RecordDebugOp(SurfaceOp::CustomMatch, load_info.addr, load_info.end, &surface, nullptr,
+                  {.hash = hash});
 
     // Decode finishes on a later frame, so the callback checks the slot again before uploading
     const SurfaceParams expected_surface = surface;
 
-    const auto upload = [this, level, surface_id, material, expected_surface, load_info,
-                         hash]() -> bool {
+    const auto upload = [this, level, surface_id, material, expected_surface, load_info, hash,
+                         imported]() -> bool {
         if (!slot_surfaces.contains(surface_id)) {
             return false;
         }
@@ -1221,46 +1324,80 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
             }
         }
 
-        // Queuing set this flag on the old surface. Set it again for a surface that was
-        // recreated with the same guest parameters before the image is replaced.
-        target.flags |= SurfaceFlagBits::Custom;
-        // A new base material replaces the image in this slot. The previous image is sentenced
-        // and the page table keeps surface_id
-        if (!target.IsCustom() || (level == 0 && target.material != material)) {
-            const SurfaceBase old_surface{target};
-            const SurfaceId old_id =
-                slot_surfaces.swap_and_insert(surface_id, runtime, old_surface, material);
-            Surface& replaced = slot_surfaces[old_id];
-            replaced.flags &= ~SurfaceFlagBits::Registered;
-            // The sentenced copy inherited the flag set above. A guest image is not custom
-            if (!replaced.IsCustom()) {
-                replaced.flags &= ~SurfaceFlagBits::Custom;
-            }
-            SentenceSurface(old_id);
-        }
-
-        // swap_and_insert can grow slot_surfaces, so the reference above may be dangling
-        Surface& custom_surface = slot_surfaces[surface_id];
-        custom_surface.UploadCustom(material, level);
-        if (custom_tex_manager.SkipMipmaps()) {
-            runtime.GenerateMipmaps(custom_surface);
-        }
+        // An imported texture has no mip levels of its own
+        ReplaceWithMaterial(surface_id, material, level,
+                            imported || custom_tex_manager.SkipMipmaps());
         return true;
     };
+    // An imported texture is already decoded
+    if (imported) {
+        return upload();
+    }
     return custom_tex_manager.Decode(material, std::move(upload));
+}
+
+template <class T>
+void RasterizerCache<T>::ReplaceWithMaterial(SurfaceId surface_id, Material* material, u32 level,
+                                             bool generate_mipmaps) {
+    Surface& target = slot_surfaces[surface_id];
+    // Queuing an upload set this flag on the old surface. Set it again for a surface that was
+    // recreated with the same guest parameters, or replaced by the debugging tool, before the
+    // image is replaced.
+    target.flags |= SurfaceFlagBits::Custom;
+    // A new base material replaces the image in this slot. The previous image is sentenced
+    // and the page table keeps surface_id
+    if (!target.IsCustom() || (level == 0 && target.material != material)) {
+        const SurfaceBase old_surface{target};
+        const SurfaceId old_id =
+            slot_surfaces.swap_and_insert(surface_id, runtime, old_surface, material);
+        Surface& replaced = slot_surfaces[old_id];
+        replaced.flags &= ~SurfaceFlagBits::Registered;
+        // The sentenced copy inherited the flag set above. A guest image is not custom
+        if (!replaced.IsCustom()) {
+            replaced.flags &= ~SurfaceFlagBits::Custom;
+        }
+#ifdef ENABLE_SURFACE_VIEWER
+        // The custom image keeps the unique ID of the surface it replaces in the cache
+        replaced.debug.unique_id = 0;
+#endif
+        SentenceSurface(old_id);
+    }
+
+    // swap_and_insert can grow slot_surfaces, so the reference above may be dangling
+    Surface& custom_surface = slot_surfaces[surface_id];
+    custom_surface.UploadCustom(material, level);
+#ifdef ENABLE_SURFACE_VIEWER
+    if (debug_tracking) [[unlikely]] {
+        u64 bytes = 0;
+        for (const CustomTexture* texture : material->textures) {
+            if (texture) {
+                bytes += texture->data.size();
+            }
+        }
+        CountDebugTransfer(SurfaceOp::CustomUpload, custom_surface, custom_surface.addr,
+                           custom_surface.end, bytes);
+    }
+#endif
+    if (generate_mipmaps) {
+        runtime.GenerateMipmaps(custom_surface);
+        RecordDebugOp(SurfaceOp::GenerateMipmaps, custom_surface.addr, custom_surface.end,
+                      &custom_surface);
+    }
 }
 
 template <class T>
 void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_DownloadSurface);
+    MarkDebugUsage(surface, SurfaceUsageBits::Download);
 
     const SurfaceParams flush_info = surface.FromInterval(interval);
     const u32 flush_start = boost::icl::first(interval);
     const u32 flush_end = boost::icl::last_next(interval);
     ASSERT(flush_start >= surface.addr && flush_end <= surface.end);
 
-    const auto staging = runtime.FindStaging(
-        flush_info.width * flush_info.height * surface.GetInternalBytesPerPixel(), false);
+    const u32 download_size =
+        flush_info.width * flush_info.height * surface.GetInternalBytesPerPixel();
+    const auto staging = runtime.FindStaging(download_size, false);
 
     const BufferTextureCopy download = {
         .buffer_offset = staging.offset,
@@ -1269,6 +1406,7 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
         .texture_level = surface.LevelOf(flush_start),
     };
     surface.Download(download, staging);
+    RecordDebugTransfer(SurfaceOp::Download, surface, flush_start, flush_end, download_size);
 
     MemoryRef dest_ptr = memory.GetPhysicalRef(flush_start);
     if (!dest_ptr) [[unlikely]] {
@@ -1282,6 +1420,7 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
 
 template <class T>
 void RasterizerCache<T>::DownloadFillSurface(Surface& surface, SurfaceInterval interval) {
+    MarkDebugUsage(surface, SurfaceUsageBits::Download);
     const u32 flush_start = boost::icl::first(interval);
     const u32 flush_end = boost::icl::last_next(interval);
     ASSERT(flush_start >= surface.addr && flush_end <= surface.end);
@@ -1310,6 +1449,8 @@ void RasterizerCache<T>::DownloadFillSurface(Surface& surface, SurfaceInterval i
     if (backup_bytes) {
         std::memcpy(&dest_ptr[coarse_start_offset], &backup_data[0], backup_bytes);
     }
+    RecordDebugTransfer(SurfaceOp::FillDownload, surface, flush_start, flush_end,
+                        flush_end - flush_start);
 }
 
 template <class T>
@@ -1327,6 +1468,8 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
         const u8 sample_count = src_surface.sample_count;
         if ((res_scale > surface.res_scale) || (sample_count > surface.sample_count)) {
             surface.ScaleUp(res_scale, sample_count);
+            RecordDebugOp(SurfaceOp::ScaleUp, surface.addr, surface.end, &surface, nullptr,
+                          {.scale = surface.res_scale});
         }
         const PAddr addr = boost::icl::lower(interval);
         const SurfaceParams copy_params = surface.FromInterval(copy_interval);
@@ -1339,7 +1482,12 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
             .dst_offset = {dst_rect.left, dst_rect.bottom},
             .extent = {src_rect.GetWidth(), src_rect.GetHeight()},
         };
-        return runtime.Reinterpret(src_surface, surface, reinterpret);
+        const bool reinterpreted = runtime.Reinterpret(src_surface, surface, reinterpret);
+        if (reinterpreted) {
+            RecordDebugOp(SurfaceOp::Reinterpret, copy_interval.lower(), copy_interval.upper(),
+                          &surface, &src_surface);
+        }
+        return reinterpreted;
     }
 
     bool has_invalid = false;
@@ -1372,6 +1520,7 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
 
 template <class T>
 void RasterizerCache<T>::ClearAll(bool flush) {
+    DebugOpScope op_scope(*this, SurfaceOp::ClearAll, 0, 0xFFFFFFFF);
     const auto flush_interval = PageMap::interval_type::right_open(0x0, 0xFFFFFFFF);
     // Force flush all surfaces from the cache
     if (flush) {
@@ -1402,6 +1551,9 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
 
     const SurfaceInterval flush_interval(addr, addr + size);
     SurfaceRegions flushed_intervals;
+    DebugOpScope op_scope(*this, SurfaceOp::Flush, addr, addr + size,
+                          flush_surface_id ? &slot_surfaces[flush_surface_id] : nullptr, nullptr,
+                          {}, true);
 
     for (const auto& [region, surface_id] : RangeFromInterval(dirty_regions, flush_interval)) {
         if (flush_surface_id && surface_id != flush_surface_id) {
@@ -1453,6 +1605,24 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
     }
 
     const SurfaceInterval invalid_interval(addr, addr + size);
+    DebugOpScope op_scope(*this, SurfaceOp::Invalidate, addr, addr + size,
+                          region_owner_id ? &slot_surfaces[region_owner_id] : nullptr, nullptr, {},
+                          true);
+#ifdef ENABLE_SURFACE_VIEWER
+    // Recorded when the range changes owner, not when a surface writes again what it already
+    // owns. Other invalidations are recorded when they change a surface.
+    if (debug_tracking && region_owner_id) [[unlikely]] {
+        u32 owned = 0;
+        for (const auto& [region, owner] : RangeFromInterval(dirty_regions, invalid_interval)) {
+            if (owner == region_owner_id) {
+                owned += boost::icl::length(region & invalid_interval);
+            }
+        }
+        if (owned != size) {
+            op_scope.Force();
+        }
+    }
+#endif
 
     if (region_owner_id) {
         Surface& region_owner = slot_surfaces[region_owner_id];
@@ -1475,6 +1645,14 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
             return;
         }
         const auto interval = surface.GetInterval() & invalid_interval;
+#ifdef ENABLE_SURFACE_VIEWER
+        // Recorded only when part of the interval was valid
+        if (debug_tracking && !boost::icl::contains(surface.invalid_regions, interval))
+            [[unlikely]] {
+            WriteDebugOp(SurfaceOp::MarkInvalid, interval.lower(), interval.upper(), &surface,
+                         nullptr, {});
+        }
+#endif
         surface.MarkInvalid(interval);
         if (!surface.IsFullyInvalid()) {
             return;
@@ -1496,6 +1674,7 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
 template <class T>
 SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
                                             const SurfaceFlagBits& initial_flags) {
+    [[maybe_unused]] bool recycled = false;
     const SurfaceId surface_id = [&] {
         const u64 resource_recycle_tick = runtime.GetResourceRecycleTick();
         // Try to find a matching texture in the deletion queue
@@ -1516,15 +1695,32 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
         if (it != sentenced.end()) {
             const SurfaceId surface_id = it->surface_id;
             sentenced.erase(it);
+            recycled = true;
             return surface_id;
         }
         return slot_surfaces.insert(runtime, params, initial_flags);
     }();
     Surface& surface = slot_surfaces[surface_id];
+#ifdef ENABLE_SURFACE_VIEWER
+    if (debug_tracking) [[unlikely]] {
+        const u32 recycle_count = surface.debug.recycle_count + (recycled ? 1 : 0);
+        surface.debug = {
+            .created_frame = renderer.GetCurrentFrame(),
+            .creation_tracked = true,
+            .recycle_count = recycle_count,
+            .unique_id = debug_next_unique_id++,
+        };
+        (recycled ? debug_counters.recycled : debug_counters.created)++;
+        WriteDebugOp(recycled ? SurfaceOp::Recycle : SurfaceOp::Create, surface.addr, surface.end,
+                     &surface, nullptr, {});
+    }
+#endif
     if ((params.res_scale > surface.res_scale) || (params.sample_count > surface.sample_count)) {
         // Texture is going to be upscaled, remove any previous framebuffer references
         RemoveFramebuffers(surface_id);
         surface.ScaleUp(params.res_scale, params.sample_count);
+        RecordDebugOp(SurfaceOp::ScaleUp, surface.addr, surface.end, &surface, nullptr,
+                      {.scale = surface.res_scale});
     }
     surface.MarkInvalid(surface.GetInterval());
     return surface_id;
@@ -1537,6 +1733,7 @@ void RasterizerCache<T>::RegisterSurface(SurfaceId surface_id) {
                "Trying to register an already registered surface");
 
     surface.flags |= SurfaceFlagBits::Registered;
+    RecordDebugOp(SurfaceOp::Register, surface.addr, surface.end, &surface);
     UpdatePagesCachedCount(surface.addr, surface.size, 1);
     ForEachPage(surface.addr, surface.size,
                 [this, surface_id](u64 page) { page_table[page].push_back(surface_id); });
@@ -1549,6 +1746,7 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
                "Trying to unregister an already unregistered surface");
 
     surface.flags &= ~SurfaceFlagBits::Registered;
+    RecordDebugOp(SurfaceOp::Unregister, surface.addr, surface.end, &surface);
     UpdatePagesCachedCount(surface.addr, surface.size, -1);
     ForEachPage(surface.addr, surface.size, [this, surface_id](u64 page) {
         const auto page_it = page_table.find(page);
@@ -1572,11 +1770,18 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
         return;
     }
 
+#ifdef ENABLE_SURFACE_VIEWER
+    if (debug_tracking) [[unlikely]] {
+        debug_counters.fills_erased++;
+        WriteDebugOp(SurfaceOp::EraseFill, surface.addr, surface.end, &surface, nullptr, {});
+    }
+#endif
     slot_surfaces.erase(surface_id);
 }
 
 template <class T>
 void RasterizerCache<T>::UnregisterAll() {
+    DebugOpScope op_scope(*this, SurfaceOp::UnregisterAll, 0, 0xFFFFFFFF);
     FlushAll();
     for (auto& [page, surfaces] : page_table) {
         while (!surfaces.empty()) {
@@ -1586,6 +1791,611 @@ void RasterizerCache<T>::UnregisterAll() {
     runtime.Finish();
     RunGarbageCollector();
 }
+
+#ifdef ENABLE_SURFACE_VIEWER
+template <class T>
+void RasterizerCache<T>::SetDebugTracking(bool enabled) {
+    if (enabled && !debug_tracking) {
+        debug_counters = {};
+        debug_transfers = {};
+        debug_transfer_history.clear();
+        debug_tracking_frame = renderer.GetCurrentFrame();
+    }
+    if (!enabled) {
+        debug_scopes.clear();
+        debug_draw_scope = false;
+    }
+    debug_tracking = enabled;
+}
+
+template <class T>
+SurfaceOpSurface RasterizerCache<T>::DescribeForDebugOp(Surface* surface) {
+    if (!surface) {
+        return {};
+    }
+    if (surface->debug.unique_id == 0) {
+        surface->debug.unique_id = debug_next_unique_id++;
+    }
+    return {
+        .index = slot_surfaces.IdOf(*surface).index,
+        .unique_id = surface->debug.unique_id,
+        .addr = surface->addr,
+        .size = surface->size,
+        .width = static_cast<u16>(surface->width),
+        .height = static_cast<u16>(surface->height),
+        .format = surface->pixel_format == PixelFormat::Invalid
+                      ? SurfaceOpSurface::InvalidFormat
+                      : static_cast<u8>(surface->pixel_format),
+        .type = static_cast<u8>(surface->type),
+        .texture_type = static_cast<u8>(surface->texture_type),
+        .res_scale = static_cast<u8>(std::min<u32>(surface->res_scale, 0xFF)),
+        .levels = static_cast<u8>(surface->levels),
+        .is_tiled = surface->is_tiled,
+    };
+}
+
+template <class T>
+void RasterizerCache<T>::WriteOpenDebugScopes(SurfaceOpLog& log) {
+    for (OpenDebugOp& scope : debug_scopes) {
+        if (!scope.written) {
+            log.Append(scope.record);
+            scope.written = true;
+        }
+    }
+}
+
+template <class T>
+void RasterizerCache<T>::WriteDebugOp(SurfaceOp op, PAddr start, PAddr end, Surface* surface,
+                                      Surface* other, SurfaceOpValue value) {
+    SurfaceOpLog& log = GetSurfaceOpLog();
+    if (!log.IsRecording()) {
+        return;
+    }
+    const bool usage = op == SurfaceOp::Texture || op == SurfaceOp::Display;
+    if (usage && !log.RecordsUsage()) {
+        return;
+    }
+    WriteOpenDebugScopes(log);
+    log.Append({
+        .frame = renderer.GetCurrentFrame(),
+        .value = value,
+        .start = start,
+        .end = end,
+        .surface = DescribeForDebugOp(surface),
+        .other = DescribeForDebugOp(other),
+        .op = op,
+        .depth = static_cast<u8>(std::min<std::size_t>(debug_scopes.size(), 0xFF)),
+    });
+}
+
+template <class T>
+bool RasterizerCache<T>::BeginDebugScope(SurfaceOp op, PAddr start, PAddr end, Surface* surface,
+                                         Surface* other, SurfaceOpValue value, bool lazy) {
+    SurfaceOpLog& log = GetSurfaceOpLog();
+    if (!log.IsRecording()) {
+        return false;
+    }
+    debug_scopes.push_back({
+        .record =
+            {
+                .frame = renderer.GetCurrentFrame(),
+                .value = value,
+                .start = start,
+                .end = end,
+                .surface = DescribeForDebugOp(surface),
+                .other = DescribeForDebugOp(other),
+                .op = op,
+                .depth = static_cast<u8>(std::min<std::size_t>(debug_scopes.size(), 0xFF)),
+            },
+        .written = false,
+    });
+    // Without usage, draws are kept only for the work done in them
+    const bool write_now = op == SurfaceOp::Draw ? log.RecordsUsage() : !lazy;
+    if (write_now) {
+        WriteOpenDebugScopes(log);
+    }
+    return true;
+}
+
+template <class T>
+void RasterizerCache<T>::EndDebugScope(bool force) {
+    if (debug_scopes.empty()) {
+        return;
+    }
+    SurfaceOpLog& log = GetSurfaceOpLog();
+    if (force && !debug_scopes.back().written && log.IsRecording()) {
+        WriteOpenDebugScopes(log);
+    }
+    debug_scopes.pop_back();
+}
+
+template <class T>
+void RasterizerCache<T>::CountDebugTransfer(SurfaceOp op, Surface& surface, PAddr start, PAddr end,
+                                            u64 bytes) {
+    const u64 frame = renderer.GetCurrentFrame();
+    if (debug_transfer_history.empty() || debug_transfer_history.back().frame != frame) {
+        debug_transfer_history.push_back({.frame = frame});
+        while (debug_transfer_history.front().frame + TRANSFER_HISTORY_FRAMES < frame) {
+            debug_transfer_history.pop_front();
+        }
+    }
+    SurfaceTransferStats stats{};
+    switch (op) {
+    case SurfaceOp::Upload:
+        stats.upload_bytes = bytes;
+        stats.uploads = 1;
+        surface.debug.uploaded_bytes += bytes;
+        break;
+    case SurfaceOp::CustomUpload:
+        stats.custom_upload_bytes = bytes;
+        stats.custom_uploads = 1;
+        surface.debug.uploaded_bytes += bytes;
+        break;
+    case SurfaceOp::Download:
+        stats.download_bytes = bytes;
+        stats.downloads = 1;
+        surface.debug.downloaded_bytes += bytes;
+        break;
+    case SurfaceOp::FillDownload:
+        stats.fill_bytes = bytes;
+        stats.fill_downloads = 1;
+        surface.debug.downloaded_bytes += bytes;
+        break;
+    default:
+        break;
+    }
+    debug_transfer_history.back().Add(stats);
+    debug_transfers.Add(stats);
+    WriteDebugOp(op, start, end, &surface, nullptr, {.bytes = bytes});
+}
+
+template <class T>
+void RasterizerCache<T>::RecordDebugUsage(Surface& surface, SurfaceUsageBits usage) {
+    const u64 frame = renderer.GetCurrentFrame();
+    if (surface.debug.last_used_frame != frame || False(surface.debug.last_usage)) {
+        surface.debug.last_used_frame = frame;
+        surface.debug.last_usage = usage;
+    } else {
+        surface.debug.last_usage |= usage;
+    }
+    if (usage == SurfaceUsageBits::Texture || usage == SurfaceUsageBits::Display) {
+        WriteDebugOp(usage == SurfaceUsageBits::Texture ? SurfaceOp::Texture : SurfaceOp::Display,
+                     surface.addr, surface.end, &surface, nullptr, {});
+    }
+}
+
+template <class T>
+SurfaceCacheDebugInfo RasterizerCache<T>::GetDebugInfo() const {
+    const u64 current_frame = renderer.GetCurrentFrame();
+    const u64 resource_free_tick = runtime.GetResourceFreeTick();
+    const u64 resource_recycle_tick = runtime.GetResourceRecycleTick();
+    SurfaceCacheDebugInfo info{
+        .frame = current_frame,
+        .program_id = custom_tex_manager.GetProgramId(),
+        .recycle_frames = RECYCLE_FRAMES,
+        .resource_tick = runtime.GetResourceTick(),
+        .resource_free_tick = resource_free_tick,
+        .resource_recycle_tick = resource_recycle_tick,
+        .tracking = debug_tracking,
+        .tracking_frame = debug_tracking_frame,
+        .counters = debug_counters,
+        .transfers = debug_transfers,
+    };
+    for (const SurfaceTransferStats& stats : debug_transfer_history) {
+        if (stats.frame + TRANSFER_HISTORY_FRAMES >= current_frame) {
+            info.transfer_history.push_back(stats);
+        }
+    }
+
+    std::unordered_map<u32, const SentencedSurface*> sentenced_map;
+    for (const SentencedSurface& entry : sentenced) {
+        sentenced_map.emplace(entry.surface_id.index, &entry);
+    }
+    std::unordered_map<u32, std::vector<std::pair<PAddr, PAddr>>> dirty_map;
+    for (const auto& [interval, surface_id] : dirty_regions) {
+        dirty_map[surface_id.index].emplace_back(interval.lower(), interval.upper());
+    }
+    std::unordered_map<u32, u32> framebuffer_refs;
+    for (const auto& [params, framebuffer_id] : framebuffers) {
+        if (params.color_id) {
+            framebuffer_refs[params.color_id.index]++;
+        }
+        if (params.depth_id) {
+            framebuffer_refs[params.depth_id.index]++;
+        }
+    }
+    std::unordered_map<u32, u32> cube_refs;
+    for (const auto& [config, cube] : texture_cube_cache) {
+        if (cube.surface_id) {
+            cube_refs[cube.surface_id.index]++;
+        }
+        for (const SurfaceId face_id : cube.face_ids) {
+            if (face_id) {
+                cube_refs[face_id.index]++;
+            }
+        }
+    }
+
+    info.surfaces.reserve(slot_surfaces.size());
+    slot_surfaces.ForEach([&](SurfaceId surface_id, const Surface& surface) {
+        // The null surfaces are placeholders, not textures of the game
+        if (IsNullSurface(surface_id)) {
+            return;
+        }
+        SurfaceDebugInfo& entry = info.surfaces.emplace_back();
+        entry.index = surface_id.index;
+        entry.params = surface;
+        entry.flags = static_cast<u32>(surface.flags);
+        entry.usage = surface.debug;
+
+        if (const auto it = sentenced_map.find(surface_id.index); it != sentenced_map.end()) {
+            const SentencedSurface& sentence = *it->second;
+            const u64 deletion_frame = sentence.frame + RECYCLE_FRAMES;
+            entry.sentenced = true;
+            entry.sentenced_frame = sentence.frame;
+            entry.sentenced_resource_tick = sentence.resource_tick;
+            entry.gpu_in_use = resource_free_tick <= sentence.resource_tick;
+            entry.recyclable = resource_recycle_tick > sentence.resource_tick;
+            entry.frames_until_deletion =
+                deletion_frame > current_frame ? deletion_frame - current_frame : 0;
+        }
+
+        if (surface.type != SurfaceType::Fill) {
+            entry.fully_invalid = surface.IsFullyInvalid();
+        }
+        for (const auto& interval : surface.invalid_regions) {
+            entry.invalid_bytes += boost::icl::length(interval);
+            entry.invalid_regions.emplace_back(interval.lower(), interval.upper());
+        }
+        if (const auto it = dirty_map.find(surface_id.index); it != dirty_map.end()) {
+            entry.dirty_regions = std::move(it->second);
+            for (const auto& [start, end] : entry.dirty_regions) {
+                entry.dirty_bytes += end - start;
+            }
+        }
+        entry.modification_tick = surface.modification_tick;
+        entry.fill_size = surface.fill_size;
+        entry.fill_data = surface.fill_data;
+
+        if (surface.material) {
+            entry.has_material = true;
+            entry.material_hash = surface.material->hash;
+            entry.material_width = surface.material->width;
+            entry.material_height = surface.material->height;
+            entry.has_normal_map = surface.HasNormalMap();
+            entry.material_imported = custom_tex_manager.IsImportedMaterial(surface.material);
+            if (const CustomTexture* texture = surface.material->Map(MapType::Color)) {
+                entry.material_path = texture->path;
+            }
+        }
+        if (const auto it = framebuffer_refs.find(surface_id.index); it != framebuffer_refs.end()) {
+            entry.framebuffer_refs = it->second;
+        }
+        if (const auto it = cube_refs.find(surface_id.index); it != cube_refs.end()) {
+            entry.cube_refs = it->second;
+        }
+
+        if (surface.type != SurfaceType::Fill) {
+            const u64 layers = surface.texture_type == TextureType::CubeMap ? 6 : 1;
+            u64 pixels = 0;
+            for (u32 level = 0; level < surface.levels; level++) {
+                pixels += static_cast<u64>(std::max(surface.GetScaledWidth() >> level, 1u)) *
+                          std::max(surface.GetScaledHeight() >> level, 1u);
+            }
+            entry.host_bytes =
+                pixels * layers * surface.sample_count * surface.GetInternalBytesPerPixel();
+        }
+    });
+
+    return info;
+}
+
+template <class T>
+SurfaceDebugImage RasterizerCache<T>::ReadSurfaceForDebug(u32 index, const SurfaceParams& params,
+                                                          u32 level, bool upscaled) {
+    std::string error;
+    Surface* const found = FindSurfaceForDebug(index, params, error);
+    if (!found) {
+        return {.error = std::move(error)};
+    }
+    Surface& surface = *found;
+    if (surface.type == SurfaceType::Fill) {
+        return {.error = "Fill surfaces have no texture"};
+    }
+    if (level >= surface.levels) {
+        return {.error = "The surface has no such level"};
+    }
+    if (surface.IsCustom()) {
+        // The decoded custom texture stays in memory, so it is shown instead of the GPU copy
+        const CustomTexture* texture =
+            surface.material ? surface.material->Map(MapType::Color) : nullptr;
+        if (level != 0) {
+            return {.error = "Only the base level of a custom texture is shown"};
+        }
+        if (!texture || texture->format != CustomPixelFormat::RGBA8 || texture->data.empty()) {
+            return {.error = "Compressed custom textures cannot be shown"};
+        }
+        SurfaceDebugImage image{
+            .width = texture->width,
+            .height = texture->height,
+            .rgba = texture->data,
+            .from_custom_texture = true,
+        };
+        // Decoded tiled textures start with the last row in memory
+        if (surface.is_tiled) {
+            Common::FlipRGBA8Texture(image.rgba, image.width, image.height);
+        }
+        return image;
+    }
+
+    std::string native_reason;
+    if (upscaled) {
+        if (surface.res_scale == 1) {
+            native_reason = "the surface is not upscaled";
+        } else if (surface.type != SurfaceType::Color && surface.type != SurfaceType::Texture) {
+            native_reason = "depth surfaces are read at native resolution";
+        } else if (surface.texture_type != TextureType::Texture2D) {
+            native_reason = "cube maps are read at native resolution";
+        } else {
+            return ReadScaledSurfaceForDebug(surface, level);
+        }
+    }
+
+    const SurfaceInterval interval = surface.LevelInterval(level);
+    const PAddr start = boost::icl::first(interval);
+    const PAddr end = boost::icl::last_next(interval);
+    const SurfaceParams level_params = surface.FromInterval(interval);
+    std::vector<u8> data(end - start);
+
+    // The texture of an ETC1 surface cannot be encoded back, so show guest memory instead.
+    const bool from_guest_memory =
+        surface.pixel_format == PixelFormat::ETC1 || surface.pixel_format == PixelFormat::ETC1A4;
+    if (from_guest_memory) {
+        MemoryRef source = memory.GetPhysicalRef(start);
+        if (!source || source.GetSize() < data.size()) {
+            return {.error = "The surface is not in mapped memory"};
+        }
+        std::memcpy(data.data(), source.GetPtr(), data.size());
+    } else {
+        const auto staging = runtime.FindStaging(
+            level_params.width * level_params.height * surface.GetInternalBytesPerPixel(), false);
+        const BufferTextureCopy download = {
+            .buffer_offset = staging.offset,
+            .buffer_size = staging.size,
+            .texture_rect = surface.GetSubRect(level_params),
+            .texture_level = level,
+        };
+        surface.Download(download, staging);
+        EncodeTexture(level_params, start, end, staging.mapped, data,
+                      runtime.NeedsConversion(surface));
+    }
+
+    SurfaceDebugImage image = DecodeSurfaceForDebug(level_params, data);
+    image.from_guest_memory = from_guest_memory;
+    image.native_reason = std::move(native_reason);
+    return image;
+}
+
+template <class T>
+SurfaceDebugImage RasterizerCache<T>::ReadScaledSurfaceForDebug(Surface& surface, u32 level) {
+    const SurfaceParams level_params = surface.FromInterval(surface.LevelInterval(level));
+    const auto rect = surface.GetScaledSubRect(level_params);
+    const u32 width = rect.GetWidth();
+    const u32 height = rect.GetHeight();
+    const u32 bytes_per_pixel = surface.GetInternalBytesPerPixel();
+    const u32 row_bytes = width * bytes_per_pixel;
+
+    // Read in bands of rows, as the download buffer of a backend may be smaller than the image
+    constexpr u32 max_band_bytes = 8 * 1024 * 1024;
+    const u32 band_rows = std::max(max_band_bytes / row_bytes, 1u);
+    std::vector<u8> host(static_cast<std::size_t>(row_bytes) * height);
+    for (u32 row = 0; row < height; row += band_rows) {
+        const u32 rows = std::min(band_rows, height - row);
+        const auto staging = runtime.FindStaging(row_bytes * rows, false);
+        const BufferTextureCopy download = {
+            .buffer_offset = staging.offset,
+            .buffer_size = staging.size,
+            .texture_rect = {rect.left, rect.bottom + row + rows, rect.right, rect.bottom + row},
+            .texture_level = level,
+        };
+        surface.DownloadScaledForDebug(download, staging);
+        std::memcpy(host.data() + static_cast<std::size_t>(row) * row_bytes, staging.mapped.data(),
+                    static_cast<std::size_t>(row_bytes) * rows);
+    }
+
+    // The host texture holds RGBA8 for converted formats and texture formats, and the guest
+    // encoding of the pixels otherwise
+    const bool host_rgba =
+        runtime.NeedsConversion(surface) ||
+        (surface.pixel_format >= PixelFormat::IA8 && surface.pixel_format <= PixelFormat::ETC1A4);
+    SurfaceDebugImage image;
+    if (host_rgba) {
+        image = {.width = width, .height = height, .rgba = std::move(host)};
+    } else {
+        SurfaceParams host_params = level_params;
+        host_params.width = width;
+        host_params.height = height;
+        host_params.stride = width;
+        host_params.is_tiled = false;
+        image = DecodeSurfaceForDebug(host_params, host);
+    }
+    // Host rows of a tiled surface start with the last row in memory
+    if (surface.is_tiled && image.error.empty()) {
+        Common::FlipRGBA8Texture(image.rgba, image.width, image.height);
+    }
+    image.scale = surface.res_scale;
+    return image;
+}
+
+template <class T>
+auto RasterizerCache<T>::FindSurfaceForDebug(u32 index, const SurfaceParams& params,
+                                             std::string& error) -> Surface* {
+    const SurfaceId surface_id{index};
+    if (!slot_surfaces.contains(surface_id) || IsNullSurface(surface_id)) {
+        error = "The surface no longer exists";
+        return nullptr;
+    }
+    Surface& surface = slot_surfaces[surface_id];
+    if (!(surface == params) || surface.type != params.type) {
+        error = "The surface changed since the last refresh";
+        return nullptr;
+    }
+    return &surface;
+}
+
+template <class T>
+SurfaceDebugResult RasterizerCache<T>::ImportSurfaceForDebug(u32 index, const SurfaceParams& params,
+                                                             const std::string& path,
+                                                             bool upscaled) {
+    std::string error;
+    Surface* const surface = FindSurfaceForDebug(index, params, error);
+    if (!surface) {
+        return {.error = std::move(error)};
+    }
+    if (surface->type != SurfaceType::Color && surface->type != SurfaceType::Texture) {
+        return {.error = "Only color textures can be replaced"};
+    }
+    if (True(surface->flags & SurfaceFlagBits::RenderTarget)) {
+        return {.error = "Render targets cannot be replaced"};
+    }
+    if (surface->texture_type != TextureType::Texture2D) {
+        return {.error = "Cube maps cannot be replaced, replace their faces instead"};
+    }
+    if (False(surface->flags & SurfaceFlagBits::Registered)) {
+        return {.error = "The surface is waiting for deletion"};
+    }
+    if (!runtime.SupportsCustomFormat(CustomPixelFormat::RGBA8)) {
+        return {.error = "The renderer does not support custom textures"};
+    }
+
+    auto imported = custom_tex_manager.LoadImportedMaterial(path, error);
+    if (!imported) {
+        return {.error = std::move(error)};
+    }
+    const u32 width = imported->material.width;
+    const u32 height = imported->material.height;
+    if (upscaled) {
+        const bool same_ratio =
+            static_cast<u64>(width) * surface->height == static_cast<u64>(height) * surface->width;
+        if (!same_ratio || width <= surface->width) {
+            return {.error = fmt::format(
+                        "The PNG is {}x{}. An upscaled texture must be equal or larger than "
+                        "{}x{}, with the same aspect ratio",
+                        width, height, surface->width, surface->height)};
+        }
+    } else if (width != surface->width || height != surface->height) {
+        return {.error = fmt::format("The PNG is {}x{}, but the surface is {}x{}", width, height,
+                                     surface->width, surface->height)};
+    }
+
+    // The texture replaces the guest data the surface holds now, as a pack texture does
+    const SurfaceParams load_info = surface->FromInterval(surface->LevelInterval(0));
+    MemoryRef source_ptr = memory.GetPhysicalRef(load_info.addr);
+    if (!source_ptr) {
+        return {.error = "The surface is not in mapped memory"};
+    }
+    const auto guest_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+    const u64 hash = ComputeHash(load_info, guest_data);
+
+    Material* const material = custom_tex_manager.AddImportedMaterial(hash, std::move(imported));
+    DebugOpScope op_scope(*this, SurfaceOp::Import, surface->addr, surface->end, surface, nullptr,
+                          {.hash = hash});
+    ReplaceWithMaterial(SurfaceId{index}, material, 0, true);
+    return {};
+}
+
+template <class T>
+SurfaceDebugResult RasterizerCache<T>::RevertSurfaceImportForDebug(u32 index,
+                                                                   const SurfaceParams& params) {
+    std::string error;
+    Surface* const surface = FindSurfaceForDebug(index, params, error);
+    if (!surface) {
+        return {.error = std::move(error)};
+    }
+    if (!surface->IsCustom() || !custom_tex_manager.IsImportedMaterial(surface->material)) {
+        return {.error = "The surface has no imported texture"};
+    }
+    DebugOpScope op_scope(*this, SurfaceOp::Revert, surface->addr, surface->end, surface, nullptr,
+                          {.hash = surface->material->hash});
+    custom_tex_manager.RemoveImportedMaterial(surface->material);
+    if (False(surface->flags & SurfaceFlagBits::Registered)) {
+        return {};
+    }
+
+    // The next use loads the surface again from guest memory. A surface that holds GPU data not
+    // yet flushed is kept, so that data is not lost.
+    const SurfaceId surface_id{index};
+    for (const auto& [interval, owner] : RangeFromInterval(dirty_regions, surface->GetInterval())) {
+        if (owner == surface_id) {
+            return {};
+        }
+    }
+    UnregisterSurface(surface_id);
+    return {};
+}
+
+template <class T>
+SurfaceDebugResult RasterizerCache<T>::SaveSurfaceToPackForDebug(u32 index,
+                                                                 const SurfaceParams& params,
+                                                                 u32 level) {
+    std::string error;
+    Surface* const surface = FindSurfaceForDebug(index, params, error);
+    if (!surface) {
+        return {.error = std::move(error)};
+    }
+    if (surface->type != SurfaceType::Color && surface->type != SurfaceType::Texture) {
+        return {.error = "Only color textures can be saved to a pack"};
+    }
+    if (level >= surface->levels) {
+        return {.error = "The surface has no such level"};
+    }
+    const bool imported =
+        surface->IsCustom() && custom_tex_manager.IsImportedMaterial(surface->material);
+    if (surface->IsCustom() && !imported) {
+        const CustomTexture* texture =
+            surface->material ? surface->material->Map(MapType::Color) : nullptr;
+        return {.error = fmt::format("The surface is already replaced by {}",
+                                     texture ? texture->path : "a pack texture")};
+    }
+    if (imported && level != 0) {
+        return {.error = "An imported texture has only a base level to save"};
+    }
+
+    const std::optional<CustomPackOptions> options = custom_tex_manager.ReadPackOptions(error);
+    if (!options) {
+        return {.error = std::move(error)};
+    }
+    if (level != 0 && options->skip_mipmap) {
+        return {.error = "The pack skips mip levels (it has no pack.json, or sets skip_mipmap)"};
+    }
+
+    const SurfaceParams load_info = surface->FromInterval(surface->LevelInterval(level));
+    MemoryRef source_ptr = memory.GetPhysicalRef(load_info.addr);
+    if (!source_ptr) {
+        return {.error = "The surface is not in mapped memory"};
+    }
+    const auto guest_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+    const u64 hash = ComputeHash(load_info, guest_data, options->use_new_hash);
+
+    std::optional<std::string> path;
+    if (imported) {
+        const CustomTexture* texture = surface->material->Map(MapType::Color);
+        path = custom_tex_manager.SaveToPack(load_info, level, hash, texture->data, texture->width,
+                                             texture->height, *options, error);
+    } else {
+        // Decoded as the dumper decodes it
+        std::vector<u8> decoded(load_info.width * load_info.height * 4);
+        DecodeTexture(load_info, load_info.addr, load_info.end, guest_data, decoded,
+                      load_info.type == SurfaceType::Color);
+        path = custom_tex_manager.SaveToPack(load_info, level, hash, decoded, load_info.width,
+                                             load_info.height, *options, error);
+    }
+    if (!path) {
+        return {.error = std::move(error)};
+    }
+    return {};
+}
+#endif
 
 template <class T>
 void RasterizerCache<T>::UpdatePagesCachedCount(PAddr addr, u32 size, int delta) {

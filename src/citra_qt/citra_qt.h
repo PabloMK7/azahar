@@ -34,6 +34,9 @@
 class AboutDialog;
 class QtConfig;
 class ClickableLabel;
+#ifdef ENABLE_SURFACE_VIEWER
+class DebugWorkQueue;
+#endif
 class EmuThread;
 class GameList;
 enum class GameListOpenTarget;
@@ -167,6 +170,11 @@ signals:
      * system emulation handles and memory are still valid, but are about become invalid.
      */
     void EmulationStopping();
+
+#ifdef ENABLE_SURFACE_VIEWER
+    /// Signal that is emitted when emulation starts, stops, pauses or resumes.
+    void EmulationPauseStateChanged(bool running, bool paused);
+#endif
 
     void UpdateProgress(std::size_t written, std::size_t total);
     void CIAInstallReport(Service::AM::InstallStatus status, QString filepath);
@@ -312,7 +320,9 @@ private slots:
     void ShowFullscreen();
     void HideFullscreen();
     void ToggleWindowMode();
+#ifdef ENABLE_SURFACE_VIEWER
     void OnCreateGraphicsSurfaceViewer();
+#endif
     void OnRecordMovie();
     void OnPlayMovie();
     void OnCloseMovie();
@@ -442,6 +452,9 @@ private:
     std::vector<QString> physical_devices;
 
     // Debugger panes
+#ifdef ENABLE_SURFACE_VIEWER
+    std::unique_ptr<DebugWorkQueue> debug_work_queue;
+#endif
     ProfilerWidget* profilerWidget{};
 #if MICROPROFILE_ENABLED
     MicroProfileDialog* microProfileDialog{};

@@ -1,16 +1,21 @@
-// Copyright 2014 Citra Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
 #include <QLabel>
 #include <QPushButton>
 #include "citra_qt/debugger/graphics/graphics_breakpoint_observer.h"
+#include "video_core/rasterizer_cache/pixel_format.h"
 
 class QComboBox;
 class QSpinBox;
+class QTabWidget;
 class CSpinBox;
+class DebugWorkQueue;
+class SurfaceCacheView;
+class SurfaceOpView;
 
 class GraphicsSurfaceWidget;
 
@@ -76,10 +81,12 @@ class GraphicsSurfaceWidget : public BreakPointObserverDock {
     static unsigned int NibblesPerPixel(Format format);
 
 public:
-    explicit GraphicsSurfaceWidget(Core::System& system,
+    explicit GraphicsSurfaceWidget(Core::System& system, DebugWorkQueue& work_queue,
                                    std::shared_ptr<Pica::DebugContext> debug_context,
                                    QWidget* parent = nullptr);
     void Pick(int x, int y);
+
+    void ShowInManual(u32 address, u32 width, u32 height, VideoCore::PixelFormat format);
 
 public slots:
     void OnSurfaceSourceChanged(int new_value);
@@ -90,17 +97,36 @@ public slots:
     void OnSurfacePickerXChanged(int new_value);
     void OnSurfacePickerYChanged(int new_value);
     void OnUpdate();
+    void OnEmulationStateChanged(bool running, bool paused);
 
 signals:
     void Update();
 
+    /// Frame controls, handled like the Pause, Continue and Advance Frame actions.
+    void PauseRequested();
+    void ContinueRequested();
+    void StepRequested();
+
 private:
     void OnBreakPointHit(Pica::DebugContext::Event event, const void* data) override;
     void OnResumed() override;
+    void OnPicaBreakPointHitBeforeFlush(Pica::DebugContext::Event event) override;
 
     void SaveSurface();
+    void UpdateCacheViewActive();
+    void UpdateMenuButtons(bool at_breakpoint);
 
     Core::System& system;
+    std::weak_ptr<Pica::DebugContext> debug_context;
+    QTabWidget* tabs;
+    QWidget* manual_widget;
+    SurfaceCacheView* cache_view;
+    SurfaceOpView* ops_view;
+    QPushButton* pause_button;
+    QPushButton* step_button;
+    QPushButton* continue_button;
+    bool emulation_running = false;
+    bool emulation_paused = false;
     QComboBox* surface_source_list;
     CSpinBox* surface_address_control;
     QSpinBox* surface_width_control;
@@ -113,11 +139,12 @@ private:
     QLabel* surface_info_label;
     QPushButton* save_surface;
 
+    // Match the initial state of the controls, as the first update only comes from a breakpoint
     Source surface_source;
-    unsigned surface_address;
-    unsigned surface_width;
-    unsigned surface_height;
-    Format surface_format;
+    unsigned surface_address = 0;
+    unsigned surface_width = 0;
+    unsigned surface_height = 0;
+    Format surface_format = Format::RGBA8;
     int surface_picker_x = 0;
     int surface_picker_y = 0;
 };

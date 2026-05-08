@@ -87,6 +87,14 @@ System::System() : movie{*this}, cheat_engine{*this} {
     frame_limiter.SetWaitCallback([this](std::chrono::steady_clock::time_point deadline) {
         ProcessPendingWorkUntil(deadline);
     });
+
+#ifdef ENABLE_GDBSTUB
+    RegisterWork(WorkPoint::CpuSlice | WorkPoint::FrameLimiterWait, [this] {
+        if (GDBStub::IsServerEnabled()) {
+            GDBStub::HandlePackets(*this);
+        }
+    });
+#endif
 }
 
 System::~System() = default;
@@ -130,7 +138,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     }
 #endif
 
-    ProcessPendingWork();
+    ProcessPendingWork(WorkPoint::CpuSlice);
 
     Signal signal{Signal::None};
     u32 param{};
@@ -315,28 +323,27 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     return status;
 }
 
-void System::ProcessPendingWork() {
-    // Processes work that needs to run on the emulation thread. This function is called from
-    // two places, the RunLoop slice and during the frame limiter wait period.
-    // To wake up the frame limiter so that it processes more work, other threads must call
-    // NotifyPendingWork.
+u32 System::RegisterWork(WorkPoint points, std::function<void()> callback) {
+    const u32 id = next_work_id++;
+    registered_work.push_back({id, points, std::move(callback)});
+    return id;
+}
 
-#ifdef ENABLE_GDBSTUB
-    if (GDBStub::IsServerEnabled()) {
-        GDBStub::HandlePackets(*this);
-    }
-#endif
+void System::UnregisterWork(u32 id) {
+    std::erase_if(registered_work, [id](const RegisteredWork& work) { return work.id == id; });
+}
 
-#ifdef ENABLE_SCRIPTING
-    if (rpc_server) {
-        rpc_server->ProcessCoreRequests();
+void System::ProcessPendingWork(WorkPoint point) {
+    for (const auto& work : registered_work) {
+        if (True(work.points & point)) {
+            work.callback();
+        }
     }
-#endif
 }
 
 void System::ProcessPendingWorkUntil(std::chrono::steady_clock::time_point deadline) {
     do {
-        ProcessPendingWork();
+        ProcessPendingWork(WorkPoint::FrameLimiterWait);
     } while (pending_work_event.WaitUntil(deadline));
 }
 

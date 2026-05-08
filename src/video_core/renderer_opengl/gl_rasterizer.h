@@ -1,6 +1,6 @@
-// Copyright 2022-2025 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Copyright 2022-2026 Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -50,6 +50,22 @@ public:
     void InvalidateRegion(PAddr addr, u32 size) override;
     void FlushAndInvalidateRegion(PAddr addr, u32 size) override;
     void ClearAll(bool flush) override;
+#ifdef ENABLE_SURFACE_VIEWER
+    void SetSurfaceDebugTracking(bool enabled) override;
+    std::optional<VideoCore::SurfaceCacheDebugInfo> GetSurfaceDebugInfo() override;
+    VideoCore::SurfaceDebugImage ReadSurfaceForDebug(u32 index,
+                                                     const VideoCore::SurfaceParams& params,
+                                                     u32 level, bool upscaled) override;
+    VideoCore::SurfaceDebugResult ImportSurfaceForDebug(u32 index,
+                                                        const VideoCore::SurfaceParams& params,
+                                                        const std::string& path,
+                                                        bool upscaled) override;
+    VideoCore::SurfaceDebugResult RevertSurfaceImportForDebug(
+        u32 index, const VideoCore::SurfaceParams& params) override;
+    VideoCore::SurfaceDebugResult SaveSurfaceToPackForDebug(u32 index,
+                                                            const VideoCore::SurfaceParams& params,
+                                                            u32 level) override;
+#endif
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;

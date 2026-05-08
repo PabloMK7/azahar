@@ -835,6 +835,36 @@ void RasterizerVulkan::ClearAll(bool flush) {
     res_cache.ClearAll(flush);
 }
 
+#ifdef ENABLE_SURFACE_VIEWER
+void RasterizerVulkan::SetSurfaceDebugTracking(bool enabled) {
+    res_cache.SetDebugTracking(enabled);
+}
+
+std::optional<VideoCore::SurfaceCacheDebugInfo> RasterizerVulkan::GetSurfaceDebugInfo() {
+    return res_cache.GetDebugInfo();
+}
+
+VideoCore::SurfaceDebugImage RasterizerVulkan::ReadSurfaceForDebug(
+    u32 index, const VideoCore::SurfaceParams& params, u32 level, bool upscaled) {
+    return res_cache.ReadSurfaceForDebug(index, params, level, upscaled);
+}
+
+VideoCore::SurfaceDebugResult RasterizerVulkan::ImportSurfaceForDebug(
+    u32 index, const VideoCore::SurfaceParams& params, const std::string& path, bool upscaled) {
+    return res_cache.ImportSurfaceForDebug(index, params, path, upscaled);
+}
+
+VideoCore::SurfaceDebugResult RasterizerVulkan::RevertSurfaceImportForDebug(
+    u32 index, const VideoCore::SurfaceParams& params) {
+    return res_cache.RevertSurfaceImportForDebug(index, params);
+}
+
+VideoCore::SurfaceDebugResult RasterizerVulkan::SaveSurfaceToPackForDebug(
+    u32 index, const VideoCore::SurfaceParams& params, u32 level) {
+    return res_cache.SaveSurfaceToPackForDebug(index, params, level);
+}
+#endif
+
 bool RasterizerVulkan::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     return res_cache.AccelerateDisplayTransfer(config);
 }
@@ -869,6 +899,7 @@ bool RasterizerVulkan::AccelerateDisplay(const Pica::FramebufferConfig& config,
     if (!src_surface_id) {
         return false;
     }
+    res_cache.MarkDebugUsage(src_surface_id, VideoCore::SurfaceUsageBits::Display);
 
     Surface& src_surface = res_cache.GetSurface(src_surface_id);
     const u32 scaled_width = src_surface.GetScaledWidth();

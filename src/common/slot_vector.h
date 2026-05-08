@@ -94,6 +94,27 @@ public:
         return values_capacity - free_list.size();
     }
 
+    /// Calls func(SlotId, const T&) for every stored value
+    template <typename Func>
+    void ForEach(Func&& func) const {
+        std::size_t index = 0;
+        for (u64 bits : stored_bitset) {
+            for (std::size_t bit = 0; bits; ++bit, bits >>= 1) {
+                if ((bits & 1) != 0) {
+                    const u32 i = static_cast<u32>(index + bit);
+                    func(SlotId{i}, values[i].object);
+                }
+            }
+            index += 64;
+        }
+    }
+
+    [[nodiscard]] SlotId IdOf(const T& object) const noexcept {
+        const auto* const entry = reinterpret_cast<const Entry*>(&object);
+        DEBUG_ASSERT(entry >= values && entry < values + values_capacity);
+        return SlotId{static_cast<u32>(entry - values)};
+    }
+
 private:
     struct NonTrivialDummy {
         NonTrivialDummy() noexcept {}

@@ -6,11 +6,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <boost/optional.hpp>
 #include <boost/serialization/version.hpp>
+#include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "common/thread.h"
 #include "common/vector_math.h"
@@ -78,6 +81,19 @@ class ARM_Interface;
 class ExclusiveMonitor;
 class Timing;
 
+/// Points of the emulation thread where registered work runs.
+enum class WorkPoint : u32 {
+    /// Before every CPU slice of RunLoop
+    CpuSlice = 1 << 0,
+    /// While the frame limiter waits, also while paused with frame advancing
+    FrameLimiterWait = 1 << 1,
+    /// At the end of every frame, before the frame limiter
+    FrameEnd = 1 << 2,
+    /// While stopped at a Pica breakpoint
+    PicaBreakpoint = 1 << 3,
+};
+DECLARE_ENUM_FLAG_OPERATORS(WorkPoint);
+
 class System {
 public:
     /**
@@ -130,16 +146,27 @@ public:
     [[nodiscard]] ResultStatus RunLoop(bool tight_loop = true);
 
     /**
-     * Runs one pass of all the work that must happen on the emulation thread outside of guest
-     * execution (such as GDB or scripting requests). Called by RunLoop between slices and from
-     * the frame limiter.
+     * Registers work that must happen on the emulation thread outside of guest execution (such
+     * as GDB or scripting requests). The callback runs at each of the given points until it is
+     * unregistered. Threads that hand work to a callback call NotifyPendingWork, so that it runs
+     * without waiting for the frame limiter. Must be called from the emulation thread or while it
+     * is not running, and never from a callback.
+     * @return The ID to unregister the work with.
      */
-    void ProcessPendingWork();
+    u32 RegisterWork(WorkPoint points, std::function<void()> callback);
+
+    /// Unregisters work registered with RegisterWork. Same requirements as RegisterWork.
+    void UnregisterWork(u32 id);
 
     /**
-     * Runs ProcessPendingWork until the deadline, sleeping in between until either the deadline
-     * passes or NotifyPendingWork is called. The frame limiter calls this instead of sleeping.
-     * Must be called from the emulation thread.
+     * Runs the work registered for the given point. Must be called from the emulation thread.
+     */
+    void ProcessPendingWork(WorkPoint point);
+
+    /**
+     * Runs the work of WorkPoint::FrameLimiterWait until the deadline, sleeping in between until
+     * either the deadline passes or NotifyPendingWork is called. The frame limiter calls this
+     * instead of sleeping. Must be called from the emulation thread.
      */
     void ProcessPendingWorkUntil(std::chrono::steady_clock::time_point deadline);
 
@@ -539,6 +566,13 @@ private:
 private:
     static System s_instance;
 
+    struct RegisteredWork {
+        u32 id;
+        WorkPoint points;
+        std::function<void()> callback;
+    };
+    std::vector<RegisteredWork> registered_work;
+    u32 next_work_id = 0;
     Common::Event pending_work_event;
 
     std::atomic_bool is_powered_on{};

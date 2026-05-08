@@ -54,7 +54,10 @@
 #include "citra_qt/debugger/graphics/graphics.h"
 #include "citra_qt/debugger/graphics/graphics_breakpoints.h"
 #include "citra_qt/debugger/graphics/graphics_cmdlists.h"
+#ifdef ENABLE_SURFACE_VIEWER
+#include "citra_qt/debugger/debug_work_queue.h"
 #include "citra_qt/debugger/graphics/graphics_surface.h"
+#endif
 #include "citra_qt/debugger/graphics/graphics_tracing.h"
 #include "citra_qt/debugger/graphics/graphics_vertex_shader.h"
 #include "citra_qt/debugger/ipc/recorder.h"
@@ -729,12 +732,13 @@ void GMainWindow::InitializeWidgets() {
 }
 
 void GMainWindow::InitializeDebugWidgets() {
-    if (Pica::g_debug_context) {
-        connect(ui->action_Create_Pica_Surface_Viewer, &QAction::triggered, this,
-                &GMainWindow::OnCreateGraphicsSurfaceViewer);
-    } else {
-        ui->action_Create_Pica_Surface_Viewer->setEnabled(false);
-    }
+#ifdef ENABLE_SURFACE_VIEWER
+    debug_work_queue = std::make_unique<DebugWorkQueue>(system);
+    connect(ui->action_Create_Pica_Surface_Viewer, &QAction::triggered, this,
+            &GMainWindow::OnCreateGraphicsSurfaceViewer);
+#else
+    ui->action_Create_Pica_Surface_Viewer->setVisible(false);
+#endif
 
     QMenu* debug_menu = ui->menu_View_Debugging;
 
@@ -1376,6 +1380,10 @@ void GMainWindow::UpdateMenuState() {
     } else {
         ui->action_Pause->setText(tr("Pause"));
     }
+
+#ifdef ENABLE_SURFACE_VIEWER
+    emit EmulationPauseStateChanged(emulation_running, is_paused);
+#endif
 }
 
 void GMainWindow::OnDisplayTitleBars(bool show) {
@@ -1786,6 +1794,10 @@ void GMainWindow::ShutdownGame() {
     // Wait for emulation thread to complete and delete it
     emu_thread->wait();
     emu_thread = nullptr;
+
+#ifdef ENABLE_SURFACE_VIEWER
+    debug_work_queue->Clear();
+#endif
 
     system.EjectCartridge();
 
@@ -3264,13 +3276,34 @@ void GMainWindow::OnToggleFilterBar() {
     }
 }
 
+#ifdef ENABLE_SURFACE_VIEWER
 void GMainWindow::OnCreateGraphicsSurfaceViewer() {
     auto graphicsSurfaceViewerWidget =
-        new GraphicsSurfaceWidget(system, Pica::g_debug_context, this);
+        new GraphicsSurfaceWidget(system, *debug_work_queue, Pica::g_debug_context, this);
+    connect(this, &GMainWindow::EmulationPauseStateChanged, graphicsSurfaceViewerWidget,
+            &GraphicsSurfaceWidget::OnEmulationStateChanged);
+    connect(graphicsSurfaceViewerWidget, &GraphicsSurfaceWidget::PauseRequested, this, [this] {
+        if (emulation_running && emu_thread->IsRunning() &&
+            !system.frame_limiter.IsFrameAdvancing()) {
+            OnPauseGame();
+        }
+    });
+    connect(graphicsSurfaceViewerWidget, &GraphicsSurfaceWidget::ContinueRequested, this, [this] {
+        if (emulation_running &&
+            (!emu_thread->IsRunning() || system.frame_limiter.IsFrameAdvancing())) {
+            OnResumeGame(false);
+        }
+    });
+    connect(graphicsSurfaceViewerWidget, &GraphicsSurfaceWidget::StepRequested, this, [this] {
+        if (emulation_running && system.frame_limiter.IsFrameAdvancing()) {
+            system.frame_limiter.AdvanceFrame();
+        }
+    });
     addDockWidget(Qt::RightDockWidgetArea, graphicsSurfaceViewerWidget);
-    // TODO: Maybe graphicsSurfaceViewerWidget->setFloating(true);
     graphicsSurfaceViewerWidget->show();
+    UpdateMenuState();
 }
+#endif
 
 void GMainWindow::OnRecordMovie() {
     MovieRecordDialog dialog(this, system);

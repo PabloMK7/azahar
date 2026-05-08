@@ -38,14 +38,14 @@ public:
 
     void QueueRequest(std::unique_ptr<RPC::Packet> request);
 
-    /// Handles the requests that must run on the emulation thread. Must be called from the
-    /// emulation thread. Does nothing unless built with ENABLE_SCRIPTING_SYNC.
-    void ProcessCoreRequests();
-
     /// Stops the request handler and screenshot threads. No replies are sent after this returns.
     void Stop();
 
 private:
+    /// Handles the requests forwarded to the emulation thread, from the work registered with the
+    /// system in sync mode.
+    void ProcessCoreRequests();
+
     void HandleReadMemory(Packet& packet, u32 address, u32 data_size);
     void HandleWriteMemory(Packet& packet, u32 address, std::span<const u8> data);
     void HandleProcessList(Packet& packet, u32 start_index, u32 max_amount);
@@ -66,6 +66,7 @@ private:
 
 private:
     Core::System& system;
+    u32 core_work_id = 0;
     u32 selected_pid = 0xFFFFFFFF;
     Common::SPSCQueue<std::unique_ptr<Packet>, true> request_queue;
     /// Requests forwarded from the RPC thread to the emulation thread (sync mode only)

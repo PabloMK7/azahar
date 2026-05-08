@@ -1,7 +1,8 @@
 // Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -26,12 +27,20 @@ using nihstro::DVLPHeader;
 namespace Pica {
 
 void DebugContext::DoOnEvent(Event event, const void* data) {
+    auto& system = Core::System::GetInstance();
     {
         std::unique_lock lock{breakpoint_mutex};
 
+#ifdef ENABLE_SURFACE_VIEWER
+        // Let observers see the caches before the flush below cleans them
+        for (auto& breakpoint_observer : breakpoint_observers) {
+            breakpoint_observer->OnPicaBreakPointHitBeforeFlush(event);
+        }
+#endif
+
         // Commit the rasterizer's caches so framebuffers, render targets, etc. will show on debug
         // widgets
-        Core::System::GetInstance().GPU().Renderer().Rasterizer()->FlushAll();
+        system.GPU().Renderer().Rasterizer()->FlushAll();
 
         // TODO: Should stop the CPU thread here once we multithread emulation.
 
@@ -43,8 +52,15 @@ void DebugContext::DoOnEvent(Event event, const void* data) {
             breakpoint_observer->OnPicaBreakPointHit(event, data);
         }
 
-        // Wait until another thread tells us to Resume()
-        resume_from_breakpoint.wait(lock, [&] { return !at_breakpoint; });
+        // Wait until another thread tells us to Resume(). Debugging tools may queue work for the
+        // emulation thread meanwhile, so run it between short waits.
+        constexpr auto check_interval = std::chrono::milliseconds(2);
+        while (!resume_from_breakpoint.wait_for(lock, check_interval,
+                                                [&] { return !at_breakpoint; })) {
+            lock.unlock();
+            system.ProcessPendingWork(Core::WorkPoint::PicaBreakpoint);
+            lock.lock();
+        }
     }
 }
 

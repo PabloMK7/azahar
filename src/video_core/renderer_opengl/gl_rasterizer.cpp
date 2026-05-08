@@ -865,6 +865,36 @@ void RasterizerOpenGL::ClearAll(bool flush) {
     res_cache.ClearAll(flush);
 }
 
+#ifdef ENABLE_SURFACE_VIEWER
+void RasterizerOpenGL::SetSurfaceDebugTracking(bool enabled) {
+    res_cache.SetDebugTracking(enabled);
+}
+
+std::optional<VideoCore::SurfaceCacheDebugInfo> RasterizerOpenGL::GetSurfaceDebugInfo() {
+    return res_cache.GetDebugInfo();
+}
+
+VideoCore::SurfaceDebugImage RasterizerOpenGL::ReadSurfaceForDebug(
+    u32 index, const VideoCore::SurfaceParams& params, u32 level, bool upscaled) {
+    return res_cache.ReadSurfaceForDebug(index, params, level, upscaled);
+}
+
+VideoCore::SurfaceDebugResult RasterizerOpenGL::ImportSurfaceForDebug(
+    u32 index, const VideoCore::SurfaceParams& params, const std::string& path, bool upscaled) {
+    return res_cache.ImportSurfaceForDebug(index, params, path, upscaled);
+}
+
+VideoCore::SurfaceDebugResult RasterizerOpenGL::RevertSurfaceImportForDebug(
+    u32 index, const VideoCore::SurfaceParams& params) {
+    return res_cache.RevertSurfaceImportForDebug(index, params);
+}
+
+VideoCore::SurfaceDebugResult RasterizerOpenGL::SaveSurfaceToPackForDebug(
+    u32 index, const VideoCore::SurfaceParams& params, u32 level) {
+    return res_cache.SaveSurfaceToPackForDebug(index, params, level);
+}
+#endif
+
 bool RasterizerOpenGL::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     return res_cache.AccelerateDisplayTransfer(config);
 }
@@ -899,6 +929,7 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
     if (!src_surface_id) {
         return false;
     }
+    res_cache.MarkDebugUsage(src_surface_id, VideoCore::SurfaceUsageBits::Display);
 
     const DebugScope scope{runtime,
                            Common::Vec4f{0.f, 1.f, 1.f, 1.f},

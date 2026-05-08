@@ -23,10 +23,6 @@ public:
 
     void NewRequestCallback(std::unique_ptr<Packet> new_request);
 
-    void ProcessCoreRequests() {
-        rpc_server.ProcessCoreRequests();
-    }
-
 private:
     RPCServer rpc_server;
     std::unique_ptr<UDPServer> udp_server;

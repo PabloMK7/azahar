@@ -268,6 +268,13 @@ public:
     void Download(const VideoCore::BufferTextureCopy& download,
                   const VideoCore::StagingData& staging);
 
+#ifdef ENABLE_SURFACE_VIEWER
+    /// Downloads pixel data of the upscaled texture to staging without scaling it down. The
+    /// rectangle is in scaled coordinates. Used by the surface viewer.
+    void DownloadScaledForDebug(const VideoCore::BufferTextureCopy& download,
+                                const VideoCore::StagingData& staging);
+#endif
+
     /// Scales up the surface to match the new resolution scale and sample-count.
     void ScaleUp(u32 new_scale, u8 new_sample_count);
 
@@ -283,6 +290,9 @@ public:
 private:
     /// Performs blit between the scaled/unscaled images
     void BlitScale(const VideoCore::TextureBlit& blit, bool up_scale);
+
+    /// Records a copy of a rectangle of one of the images to the download buffer
+    void RecordDownload(Type image_type, const VideoCore::BufferTextureCopy& download);
 
     /// Downloads scaled depth stencil data
     void DepthStencilDownload(const VideoCore::BufferTextureCopy& download,

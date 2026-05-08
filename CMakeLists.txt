@@ -109,7 +109,7 @@ endif()
 set(_LIBRETRO_INCOMPATIBLE_OPTIONS
     ENABLE_SDL2 ENABLE_QT ENABLE_WEB_SERVICE ENABLE_SCRIPTING ENABLE_FREECAM ENABLE_GDBSTUB
     ENABLE_OPENAL ENABLE_ROOM ENABLE_ROOM_STANDALONE ENABLE_CUBEB ENABLE_LIBUSB
-    ENABLE_FFMPEG)
+    ENABLE_FFMPEG ENABLE_SURFACE_VIEWER)
 set(_USER_SET_OPTIONS "")
 foreach(_opt IN LISTS _LIBRETRO_INCOMPATIBLE_OPTIONS)
     if(DEFINED ${_opt})
@@ -128,6 +128,7 @@ option(USE_SYSTEM_TEAKRA "Use system teakra lib (instead of the bundled one)" OF
 option(ENABLE_QT "Enable the Qt frontend" ON)
 option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" ON)
 option(ENABLE_QT_UPDATE_CHECKER "Enable built-in update checker for the Qt frontend" OFF)
+CMAKE_DEPENDENT_OPTION(ENABLE_SURFACE_VIEWER "Enable the surface viewer debugging tool of the Qt frontend" ON "ENABLE_QT" OFF)
 
 CMAKE_DEPENDENT_OPTION(ENABLE_TESTS "Enable generating tests executable" ON "NOT IOS" OFF)
 CMAKE_DEPENDENT_OPTION(ENABLE_ROOM "Enable dedicated room functionality" ON "NOT ANDROID AND NOT IOS" OFF)

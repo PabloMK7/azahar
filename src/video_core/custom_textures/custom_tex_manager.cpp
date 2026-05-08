@@ -1,7 +1,8 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
+#include <algorithm>
 #include <json.hpp>
 #include "common/file_util.h"
 #include "common/literals.h"
@@ -42,6 +43,28 @@ CustomFileFormat MakeFileFormat(std::string_view ext) {
         return CustomFileFormat::KTX;
     }
     return CustomFileFormat::None;
+}
+
+#ifdef ENABLE_SURFACE_VIEWER
+std::string GetLoadPath(u64 title_id) {
+    return fmt::format("{}textures/{:016X}/", GetUserPath(FileUtil::UserPath::LoadDir), title_id);
+}
+#endif
+
+void WritePackConfigTemplate(const std::string& pack_config) {
+    nlohmann::ordered_json json;
+    json["author"] = "citra";
+    json["version"] = "1.0.0";
+    json["description"] = "A graphics pack";
+
+    auto& options = json["options"];
+    options["skip_mipmap"] = false;
+    options["flip_png_files"] = true;
+    options["use_new_hash"] = true;
+
+    FileUtil::IOFile file{pack_config, "w"};
+    const std::string output = json.dump(4);
+    file.WriteString(output);
 }
 
 MapType MakeMapType(std::string_view ext) {
@@ -188,20 +211,7 @@ void CustomTexManager::PrepareDumping(u64 title_id) {
     if (FileUtil::Exists(pack_config)) {
         return;
     }
-
-    nlohmann::ordered_json json;
-    json["author"] = "citra";
-    json["version"] = "1.0.0";
-    json["description"] = "A graphics pack";
-
-    auto& options = json["options"];
-    options["skip_mipmap"] = false;
-    options["flip_png_files"] = true;
-    options["use_new_hash"] = true;
-
-    FileUtil::IOFile file{pack_config, "w"};
-    const std::string output = json.dump(4);
-    file.WriteString(output);
+    WritePackConfigTemplate(pack_config);
 }
 
 void CustomTexManager::PreloadTextures(const std::atomic_bool& stop_run,
@@ -311,6 +321,139 @@ bool CustomTexManager::Decode(Material* material, std::function<bool()>&& upload
     });
     return false;
 }
+
+#ifdef ENABLE_SURFACE_VIEWER
+u64 CustomTexManager::GetProgramId() const {
+    return system.Kernel().GetCurrentProcess()->codeset->program_id;
+}
+
+std::unique_ptr<ImportedMaterial> CustomTexManager::LoadImportedMaterial(const std::string& path,
+                                                                         std::string& error) {
+    auto imported = std::make_unique<ImportedMaterial>();
+    imported->texture = std::make_unique<CustomTexture>(image_interface);
+    CustomTexture* const texture = imported->texture.get();
+    texture->path = path;
+    texture->file_format = CustomFileFormat::PNG;
+    texture->type = MapType::Color;
+    texture->LoadFromDisk(true);
+    if (!texture->IsLoaded()) {
+        error = fmt::format("Unable to read {} as a PNG", path);
+        return nullptr;
+    }
+
+    Material& material = imported->material;
+    material.AddMapTexture(texture);
+    material.LoadFromDisk(true);
+    if (!material.IsDecoded()) {
+        error = fmt::format("Unable to use {} as a texture", path);
+        return nullptr;
+    }
+    material.size = texture->data.size();
+    return imported;
+}
+
+Material* CustomTexManager::AddImportedMaterial(u64 data_hash,
+                                                std::unique_ptr<ImportedMaterial> imported) {
+    Material* const material = &imported->material;
+    material->hash = data_hash;
+    imported_materials.push_back(std::move(imported));
+    imported_map[data_hash] = material;
+    return material;
+}
+
+void CustomTexManager::RemoveImportedMaterial(const Material* material) {
+    std::erase_if(imported_map, [material](const auto& entry) { return entry.second == material; });
+}
+
+void CustomTexManager::ClearImportedMaterials() {
+    imported_map.clear();
+}
+
+bool CustomTexManager::IsImportedMaterial(const Material* material) const {
+    return std::any_of(imported_map.begin(), imported_map.end(),
+                       [material](const auto& entry) { return entry.second == material; });
+}
+
+std::optional<CustomPackOptions> CustomTexManager::ReadPackOptions(std::string& error) const {
+    const std::string load_path = GetLoadPath(GetProgramId());
+    const std::string config_path = load_path + "pack.json";
+    CustomPackOptions options{};
+
+    if (!FileUtil::Exists(config_path)) {
+        bool has_textures = false;
+        if (FileUtil::Exists(load_path)) {
+            FileUtil::FSTEntry texture_dir;
+            std::vector<FileUtil::FSTEntry> files;
+            FileUtil::ScanDirectoryTree(load_path, texture_dir, 64);
+            FileUtil::GetAllFilesFromNestedEntries(texture_dir, files);
+            for (const FileUtil::FSTEntry& file : files) {
+                const auto parts = Common::SplitString(file.virtualName, '.');
+                if (!file.isDirectory && !parts.empty() &&
+                    MakeFileFormat(parts.back()) != CustomFileFormat::None) {
+                    has_textures = true;
+                    break;
+                }
+            }
+        }
+        if (!has_textures) {
+            options.needs_config = true;
+            options.skip_mipmap = false;
+            options.use_new_hash = true;
+        }
+        return options;
+    }
+
+    FileUtil::IOFile config_file{config_path, "r"};
+    if (!config_file.IsOpen()) {
+        error = fmt::format("Unable to open {}", config_path);
+        return std::nullopt;
+    }
+    std::string config(config_file.GetSize(), '\0');
+    if (config_file.ReadBytes(config.data(), config.size()) == 0) {
+        error = fmt::format("Unable to read {}", config_path);
+        return std::nullopt;
+    }
+    const nlohmann::json json = nlohmann::json::parse(config, nullptr, false, true);
+    if (json.is_discarded() || !json.contains("options") || !json["options"].is_object()) {
+        error = fmt::format("Unable to parse the options in {}", config_path);
+        return std::nullopt;
+    }
+    const auto& json_options = json["options"];
+    options.has_config = true;
+    options.skip_mipmap = json_options.value("skip_mipmap", false);
+    options.flip_png_files = json_options.value("flip_png_files", true);
+    options.use_new_hash = json_options.value("use_new_hash", false);
+    return options;
+}
+
+std::optional<std::string> CustomTexManager::SaveToPack(const SurfaceParams& params, u32 level,
+                                                        u64 data_hash, std::span<const u8> rgba,
+                                                        u32 width, u32 height,
+                                                        const CustomPackOptions& options,
+                                                        std::string& error) {
+    const std::string load_path = GetLoadPath(GetProgramId());
+    if (!FileUtil::CreateFullPath(load_path)) {
+        error = fmt::format("Unable to create {}", load_path);
+        return std::nullopt;
+    }
+    if (options.needs_config) {
+        WritePackConfigTemplate(load_path + "pack.json");
+    }
+
+    const std::string path =
+        load_path + fmt::format("tex1_{}x{}_{:016X}_{}_mip{}.png", params.width, params.height,
+                                data_hash, params.pixel_format, level);
+    std::vector<u8> pixels(rgba.begin(), rgba.end());
+    if (options.flip_png_files) {
+        Common::FlipRGBA8Texture(pixels, width, height);
+    }
+    if (!image_interface.EncodePNG(path, width, height, pixels)) {
+        error = fmt::format("Unable to write {}", path);
+        return std::nullopt;
+    }
+    return path;
+}
+#endif
 
 bool CustomTexManager::ReadConfig(u64 title_id, bool options_only) {
     const std::string load_path =

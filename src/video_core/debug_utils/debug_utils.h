@@ -1,6 +1,6 @@
-// Copyright 2014 Citra Emulator Project
-// Licensed under GPLv2
-// Refer to the license.txt file included.
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -56,6 +56,9 @@ public:
         /// Constructs the object such that it observes events of the given DebugContext.
         BreakPointObserver(std::shared_ptr<DebugContext> debug_context)
             : context_weak(debug_context) {
+            if (!debug_context) {
+                return;
+            }
             std::unique_lock lock{debug_context->breakpoint_mutex};
             debug_context->breakpoint_observers.push_back(this);
         }
@@ -81,6 +84,15 @@ public:
          * @note This function will perform nothing unless it is overridden in the child class.
          */
         virtual void OnPicaBreakPointHit(Event event, const void* data) {}
+
+#ifdef ENABLE_SURFACE_VIEWER
+        /**
+         * Action to perform when a breakpoint was reached, before the rasterizer caches are
+         * flushed to guest memory. Called from the emulation thread.
+         * @param event Type of event which triggered the breakpoint
+         */
+        virtual void OnPicaBreakPointHitBeforeFlush(Event event) {}
+#endif
 
         /**
          * Action to perform when emulation is resumed from a breakpoint.
